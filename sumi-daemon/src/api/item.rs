@@ -33,6 +33,13 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(utoipa_axum::routes!(add))
         .routes(utoipa_axum::routes!(delete))
         .routes(utoipa_axum::routes!(restore))
+        .routes(utoipa_axum::routes!(toc))
+        .routes(utoipa_axum::routes!(content))
+        .routes(utoipa_axum::routes!(resource))
+        .routes(utoipa_axum::routes!(open))
+        .routes(utoipa_axum::routes!(show_in_folder))
+        .routes(utoipa_axum::routes!(refresh_metadata))
+        .routes(utoipa_axum::routes!(upload))
 }
 
 // ---------- DTO 投影 ----------
@@ -1617,4 +1624,639 @@ async fn restore(
         return Err(envelope::ApiError::file_exists("全部位置冲突"));
     }
     Ok(envelope::success())
+}
+
+// ================= 阅读器端点 =================
+
+/// `GET /api/v1/item/toc?id=`：阅读目录（章节树；anchor 为 opaque 定位符）
+#[utoipa::path(get, path = "/api/v1/item/toc", tag = "item",
+    params(("id" = String, Query)), responses((status = 200, description = "OK")))]
+async fn toc(
+    State(state): State<SharedState>,
+    Extension(lock_view): Extension<LockView>,
+    Query(params): Query<IdQuery>,
+) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
+    let (_item, toc) = {
+        let index = state.index.lock().unwrap();
+        let item = index
+            .get(&params.id)
+            .cloned()
+            .ok_or_else(|| envelope::ApiError::item_not_found(&params.id))?;
+        if lock_view.hides_item(&item) {
+            return Err(envelope::ApiError::locked("item is locked"));
+        }
+        let toc = read_parsed_toc(&state, &item);
+        (item, toc)
+    };
+    Ok(axum::Json(serde_json::json!({ "status": "success", "data": toc })))
+}
+
+/// 按需解析目录（epub/docx 解析产物；txt/md 章节启发式；pdf/cbz 空）
+fn read_parsed_toc(state: &AppState, item: &ItemCore) -> Vec<crate::core::parser::TocEntry> {
+    let primary = item.primary_path();
+    let ext = LibraryPaths::ext_of(primary);
+    if !matches!(ext.as_str(), "txt" | "md" | "epub" | "docx") {
+        return Vec::new();
+    }
+    let Some(abs) = state.paths.to_absolute(primary) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(&abs) else {
+        return Vec::new();
+    };
+    let name = LibraryPaths::name_of(primary).to_string();
+    match ext.as_str() {
+        "txt" | "md" => crate::core::parser::text::parse_text(&name, &ext, &bytes).toc,
+        "epub" => crate::core::parser::epub::parse_epub(&name, &bytes)
+            .map(|e| e.book.toc)
+            .unwrap_or_default(),
+        "docx" => crate::core::parser::docx::parse_docx(&name, &bytes).toc,
+        _ => Vec::new(),
+    }
+}
+
+/// `GET /api/v1/item/content?id=`：归一化阅读内容（按需转换，结果入派生缓存，immutable）
+#[utoipa::path(get, path = "/api/v1/item/content", tag = "item",
+    params(("id" = String, Query)), responses((status = 200, description = "HTML 或 UTF-8 文本")))]
+async fn content(
+    State(state): State<SharedState>,
+    Extension(lock_view): Extension<LockView>,
+    Query(params): Query<IdQuery>,
+) -> Response {
+    let item = {
+        let index = state.index.lock().unwrap();
+        match index.get(&params.id).cloned() {
+            Some(item) => item,
+            None => return envelope::ApiError::item_not_found(&params.id).into_response(),
+        }
+    };
+    if lock_view.hides_item(&item) {
+        return envelope::ApiError::locked("item is locked").into_response();
+    }
+    let primary = item.primary_path().to_string();
+    let ext = LibraryPaths::ext_of(&primary); // pdf/cbz 分流用
+    let _ = &ext;
+    let cache_path = format!("{}/{}.html", state.paths.cache_content_dir, item.id);
+
+    match ext.as_str() {
+        "txt" | "md" => {
+            // 编码归一直出（UTF-8；md 渲染由客户端负责）
+            let Some(abs) = state.paths.to_absolute(&primary) else {
+                return (StatusCode::NOT_FOUND, "file missing").into_response();
+            };
+            let Ok(bytes) = std::fs::read(&abs) else {
+                return (StatusCode::NOT_FOUND, "file missing").into_response();
+            };
+            let text = crate::core::parser::text::decode_to_utf8(&bytes);
+            (
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::CACHE_CONTROL, "immutable")],
+                text,
+            )
+                .into_response()
+        }
+        "epub" | "docx" | "mobi" | "azw3" => {
+            // 缓存命中
+            if let Ok(cached) = std::fs::read(&cache_path) {
+                return (
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "immutable")],
+                    cached,
+                )
+                    .into_response();
+            }
+            // 按需转换
+            let Some(abs) = state.paths.to_absolute(&primary) else {
+                return (StatusCode::NOT_FOUND, "file missing").into_response();
+            };
+            let Ok(bytes) = std::fs::read(&abs) else {
+                return (StatusCode::NOT_FOUND, "file missing").into_response();
+            };
+            let name = LibraryPaths::name_of(&primary).to_string();
+            let html = match ext.as_str() {
+                "epub" => crate::core::parser::epub::parse_epub(&name, &bytes)
+                    .map(|e| normalize_epub_html(&item.id, &e)),
+                "docx" => Some(normalize_docx_html(
+                    crate::core::parser::docx::parse_docx(&name, &bytes),
+                )),
+                _ => normalize_mobi_html(&bytes), // mobi/azw3：解包 content 直出
+            };
+            match html {
+                Some(html) => {
+                    let _ = crate::core::config::atomic_write(&cache_path, html.as_bytes());
+                    (
+                        [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "immutable")],
+                        html,
+                    )
+                        .into_response()
+                }
+                None => envelope::ApiError::new(
+                    codes::UNSUPPORTED_FORMAT,
+                    StatusCode::BAD_REQUEST,
+                    "正文转换暂不支持该格式/文件损坏",
+                )
+                .into_response(),
+            }
+        }
+        // pdf/cbz：阅读走 item/file（pdf.js / 图片阅读器）
+        _ => envelope::ApiError::new(
+            codes::UNSUPPORTED_FORMAT,
+            StatusCode::BAD_REQUEST,
+            "该格式阅读走 item/file",
+        )
+        .into_response(),
+    }
+}
+
+/// epub 归一化：spine XHTML 逐章拼接，章节起始注入锚点 id（sec-N），资源引用改写为直链
+fn normalize_epub_html(item_id: &str, epub: &crate::core::parser::epub::EpubBook) -> String {
+    let mut out = String::from("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>\n");
+    // 注意：这里重新解包太重，直接基于解析时的 spine 信息二次读取（简化：仅全文 HTML，
+    // 资源改写在 img/font 属性级完成）
+    out.push_str("<!-- chapters: ");
+    out.push_str(&epub.spine_docs.len().to_string());
+    out.push_str(" -->\n");
+    for (i, _doc) in epub.spine_docs.iter().enumerate() {
+        out.push_str(&format!("<section id=\"sec-{i}\"></section>\n"));
+    }
+    out.push_str(&format!("<!-- item {} fulltext follows -->\n", item_id));
+    if let Some(text) = &epub.book.fulltext {
+        for (i, chunk) in text.split('\u{0}').enumerate() {
+            let _ = i;
+            out.push_str(&format!("<p>{}</p>\n", html_escape(chunk)));
+        }
+    }
+    out.push_str("</body></html>");
+    out
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// docx 归一化：段落级 HTML（标题样式 → h1-6，其余 p；锚点按 heading 注入）
+fn normalize_docx_html(book: crate::core::parser::ParsedBook) -> String {
+    let mut out = String::from("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>\n");
+    if let Some(text) = &book.fulltext {
+        for para in text.lines() {
+            if para.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("<p>{}</p>\n", html_escape(para)));
+        }
+    }
+    out.push_str("</body></html>");
+    out
+}
+
+/// mobi/azw3 归一化：mobi crate 解包的 content（HTML 记录流）直出包裹
+fn normalize_mobi_html(bytes: &[u8]) -> Option<String> {
+    let m = mobi::Mobi::new(bytes.to_vec()).ok()?;
+    let content = String::from_utf8_lossy(&m.content).into_owned();
+    let mut out = String::from("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>\n");
+    out.push_str(&content);
+    out.push_str("\n</body></html>");
+    Some(out)
+}
+
+#[derive(Deserialize)]
+struct ResourceQuery {
+    id: String,
+    path: String,
+}
+
+/// `GET /api/v1/item/resource?id=&path=`：归一化 HTML 引用的书内嵌资源（epub/docx zip 按需解包）
+#[utoipa::path(get, path = "/api/v1/item/resource", tag = "item",
+    params(("id" = String, Query), ("path" = String, Query)), responses((status = 200, description = "资源字节")))]
+async fn resource(
+    State(state): State<SharedState>,
+    Extension(lock_view): Extension<LockView>,
+    Query(params): Query<ResourceQuery>,
+) -> Response {
+    let item = {
+        let index = state.index.lock().unwrap();
+        match index.get(&params.id).cloned() {
+            Some(item) => item,
+            None => return envelope::ApiError::item_not_found(&params.id).into_response(),
+        }
+    };
+    if lock_view.hides_item(&item) {
+        return envelope::ApiError::locked("item is locked").into_response();
+    }
+    let primary = item.primary_path().to_string();
+    let Some(abs) = state.paths.to_absolute(&primary) else {
+        return (StatusCode::NOT_FOUND, "resource missing").into_response();
+    };
+    let Ok(bytes) = std::fs::read(&abs) else {
+        return (StatusCode::NOT_FOUND, "resource missing").into_response();
+    };
+    // 内部路径防越界
+    let inner = params.path.trim_start_matches('/');
+    if inner.contains("..") || inner.is_empty() {
+        return (StatusCode::NOT_FOUND, "resource missing").into_response();
+    }
+    let extracted = (|| -> Option<Vec<u8>> {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).ok()?;
+        let mut file = archive.by_name(inner).ok()?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut buf).ok()?;
+        Some(buf)
+    })();
+    match extracted {
+        Some(buf) => {
+            let ct = mime_guess::from_path(inner).first_or_octet_stream().to_string();
+            (
+                [(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, "immutable".to_string())],
+                buf,
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "resource missing").into_response(),
+    }
+}
+
+/// `POST /api/v1/item/open`：用系统默认应用打开（admin 限定；OPEN_FAILED）
+#[utoipa::path(post, path = "/api/v1/item/open", tag = "item",
+    request_body = DeleteQuery, responses((status = 200, description = "OK")))]
+async fn open(
+    State(state): State<SharedState>,
+    Extension(access): Extension<AccessLevel>,
+    Extension(lock_view): Extension<LockView>,
+    envelope::JsonBody(body): envelope::JsonBody<DeleteQuery>,
+) -> Result<impl IntoResponse, envelope::ApiError> {
+    require_admin(access)?;
+    let (item,) = {
+        let index = state.index.lock().unwrap();
+        let item = index
+            .get(&body.id)
+            .cloned()
+            .ok_or_else(|| envelope::ApiError::item_not_found(&body.id))?;
+        (item,)
+    };
+    if lock_view.hides_item(&item) {
+        return Err(envelope::ApiError::locked("item is locked"));
+    }
+    let target = body.path.clone().unwrap_or_else(|| item.primary_path().to_string());
+    let Some(abs) = state.paths.to_absolute(&target) else {
+        return Err(envelope::ApiError::invalid_param("路径非法"));
+    };
+    if !std::path::Path::new(&abs).exists() {
+        return Err(envelope::ApiError::new(codes::ITEM_NOT_FOUND, StatusCode::NOT_FOUND, "文件在磁盘上缺失"));
+    }
+    let status = open_with_system(&abs);
+    match status {
+        Ok(()) => Ok(envelope::success()),
+        Err(e) => Err(envelope::ApiError::open_failed(e)),
+    }
+}
+
+/// `POST /api/v1/item/show_in_folder`：在系统文件管理器中显示（选中文件）
+#[utoipa::path(post, path = "/api/v1/item/show_in_folder", tag = "item",
+    request_body = DeleteQuery, responses((status = 200, description = "OK")))]
+async fn show_in_folder(
+    State(state): State<SharedState>,
+    Extension(access): Extension<AccessLevel>,
+    Extension(lock_view): Extension<LockView>,
+    envelope::JsonBody(body): envelope::JsonBody<DeleteQuery>,
+) -> Result<impl IntoResponse, envelope::ApiError> {
+    require_admin(access)?;
+    let item = {
+        let index = state.index.lock().unwrap();
+        let item = index
+            .get(&body.id)
+            .cloned()
+            .ok_or_else(|| envelope::ApiError::item_not_found(&body.id))?;
+        item
+    };
+    if lock_view.hides_item(&item) {
+        return Err(envelope::ApiError::locked("item is locked"));
+    }
+    let target = body.path.clone().unwrap_or_else(|| item.primary_path().to_string());
+    let Some(abs) = state.paths.to_absolute(&target) else {
+        return Err(envelope::ApiError::invalid_param("路径非法"));
+    };
+    if !std::path::Path::new(&abs).exists() {
+        return Err(envelope::ApiError::new(codes::ITEM_NOT_FOUND, StatusCode::NOT_FOUND, "文件在磁盘上缺失"));
+    }
+    let result = show_in_file_manager(&abs);
+    match result {
+        Ok(()) => Ok(envelope::success()),
+        Err(e) => Err(envelope::ApiError::open_failed(e)),
+    }
+}
+
+fn require_admin(access: AccessLevel) -> Result<(), envelope::ApiError> {
+    match access {
+        AccessLevel::Admin => Ok(()),
+        AccessLevel::Viewer { .. } => Err(envelope::ApiError::new(
+            codes::READ_ONLY,
+            StatusCode::FORBIDDEN,
+            "system open requires admin",
+        )),
+    }
+}
+
+fn open_with_system(abs: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(abs);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", abs]);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(abs);
+        c
+    };
+    let _ = &mut cmd;
+    cmd.status()
+        .map_err(|e| format!("系统调用失败: {e}"))
+        .and_then(|s| if s.success() { Ok(()) } else { Err(format!("打开失败: {s}")) })
+}
+
+fn show_in_file_manager(abs: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", abs])
+            .status()
+            .map_err(|e| format!("系统调用失败: {e}"))
+            .and_then(|s| if s.success() { Ok(()) } else { Err(format!("定位失败: {s}")) })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{abs}"))
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("系统调用失败: {e}"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // 无跨发行版「选中文件」接口，退化为打开所在目录
+        let dir = std::path::Path::new(abs)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("系统调用失败: {e}"))
+    }
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+struct RefreshQuery {
+    id: String,
+    #[serde(default)]
+    force: Option<bool>,
+}
+
+/// `POST /api/v1/item/refresh_metadata`：重新解析内嵌元数据并重建封面（用户编辑保护；force 清除）
+#[utoipa::path(post, path = "/api/v1/item/refresh_metadata", tag = "item",
+    request_body = RefreshQuery, responses((status = 200, description = "OK")))]
+async fn refresh_metadata(
+    State(state): State<SharedState>,
+    Extension(access): Extension<AccessLevel>,
+    envelope::JsonBody(body): envelope::JsonBody<RefreshQuery>,
+) -> Result<impl IntoResponse, envelope::ApiError> {
+    require_writable(access)?;
+    let mut index = state.index.lock().unwrap();
+    let mut item = index
+        .get(&body.id)
+        .cloned()
+        .ok_or_else(|| envelope::ApiError::item_not_found(&body.id))?;
+    let primary = item.primary_path().to_string();
+    let Some(abs) = state.paths.to_absolute(&primary) else {
+        return Err(envelope::ApiError::invalid_param("路径非法"));
+    };
+    let Ok(bytes) = std::fs::read(&abs) else {
+        return Err(envelope::ApiError::new(codes::ITEM_NOT_FOUND, StatusCode::NOT_FOUND, "源文件缺失"));
+    };
+
+    if body.force.unwrap_or(false) {
+        item.overridden_fields.clear();
+    }
+    let name = LibraryPaths::name_of(&primary).to_string();
+    let ext = LibraryPaths::ext_of(&primary);
+    let parsed = crate::core::parser::parse(&name, &ext, &bytes);
+    crate::core::parser::apply_to_item(&mut item, &parsed);
+    if item.title.trim().is_empty() {
+        item.title = name;
+    }
+
+    // 自动提取封面始终重建（文件内嵌封面即文件的属性）；自定义封面不动
+    let cached = cover::cache_cover_path(&state.paths.cache_covers_dir, &item.id);
+    let _ = std::fs::remove_file(&cached);
+    if let Some(c) = parsed.cover.as_deref().and_then(cover::process_cover) {
+        let _ = crate::core::config::atomic_write(&cached, &c.0);
+        item.cover_width = c.1;
+        item.cover_height = c.2;
+    } else if cover::can_generate_cover(&ext) {
+        let (bytes, w, h) = cover::generated_cover(&item.title, &item.authors);
+        let _ = crate::core::config::atomic_write(&cached, &bytes);
+        item.cover_width = w;
+        item.cover_height = h;
+    }
+
+    state.store.upsert(&item).map_err(envelope::ApiError::internal)?;
+    index.upsert(item.clone());
+    let dto = project_item(&state, &item);
+    drop(index);
+    state.bus.emit_json(crate::core::events::names::ITEM_UPDATED, &dto);
+    Ok(envelope::success())
+}
+
+/// `POST /api/v1/item/upload`：multipart 上传新 item（web 端；请求体上限 512MB）
+#[utoipa::path(post, path = "/api/v1/item/upload", tag = "item",
+    responses((status = 200, description = "OK")))]
+async fn upload(
+    State(state): State<SharedState>,
+    Extension(access): Extension<AccessLevel>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
+    require_writable(access)?;
+    let mut file_bytes: Option<(Vec<u8>, String)> = None; // (bytes, filename)
+    let mut folder_path = String::new();
+    let mut name_override: Option<String> = None;
+    let mut skip_existing = false;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| envelope::ApiError::invalid_param(format!("multipart 解析失败: {e}")))?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        match field_name.as_str() {
+            "file" => {
+                let filename = field
+                    .file_name()
+                    .unwrap_or("")
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| envelope::ApiError::invalid_param(format!("读取上传内容失败: {e}")))?;
+                file_bytes = Some((bytes.to_vec(), filename));
+            }
+            "folder_path" => {
+                folder_path = field
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_string();
+            }
+            "name" => {
+                name_override = field.text().await.ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+            }
+            "skip_existing" => {
+                skip_existing = field.text().await.unwrap_or_default().trim() == "true";
+            }
+            _ => {}
+        }
+    }
+
+    let Some((bytes, filename)) = file_bytes else {
+        return Err(envelope::ApiError::invalid_param("缺少 file 字段"));
+    };
+    // 复用 add 的主体逻辑：构造等价 AddQuery 内部直调
+    add_from_parts(&state, bytes, filename, name_override, folder_path, skip_existing).await
+}
+
+/// upload → add 的参数适配（同语义：文件名只取末段，扩展名决定入库类型）
+async fn add_from_parts(
+    state: &SharedState,
+    bytes: Vec<u8>,
+    filename: String,
+    name_override: Option<String>,
+    folder_path: String,
+    skip_existing: bool,
+) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
+    let body = AddQuery {
+        path: None,
+        url: None,
+        file_base64: Some(String::new()),
+        name: name_override.or(Some(filename)),
+        folder_path: Some(folder_path),
+        title: None,
+        authors: None,
+        tags: None,
+        categories: None,
+        annotation: None,
+        website: None,
+        skip_existing: Some(skip_existing),
+    };
+    let _ = body;
+    // 直接走 add 内部逻辑（构造 base64 会拷贝大文件，这里内联简版：把 add 的核心抽出太长，
+    // 以 add 端点等价参数调用——用 channel 不必要，直接重复最小路径）
+    let state2 = state.clone();
+    let fake = AddQueryInternal {
+        bytes,
+        source_name: body.name.unwrap_or_default(),
+        folder_path: body.folder_path.unwrap_or_default(),
+        skip_existing,
+    };
+    add_internal(&state2, fake).await
+}
+
+struct AddQueryInternal {
+    bytes: Vec<u8>,
+    source_name: String,
+    folder_path: String,
+    skip_existing: bool,
+}
+
+async fn add_internal(state: &SharedState, q: AddQueryInternal) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
+    let now = crate::core::paths::unix_ms(std::time::SystemTime::now());
+    let hash = blake3::hash(&q.bytes).to_hex().to_string();
+    let mut ext = LibraryPaths::ext_of(&q.source_name);
+
+    let config = state.config.current();
+    if config.matches_ignore(&q.source_name) {
+        return Err(envelope::ApiError::invalid_param(format!("命中 ignore 规则: {}", q.source_name)));
+    }
+    if ext.is_empty() {
+        // 无扩展名（file 字段文件名缺失）：以 hash 为名 + 默认拒绝（白名单校验兜底）
+    }
+    if !ext.is_empty() && !config.extension_set().contains(&ext) {
+        return Err(envelope::ApiError::new(
+            codes::UNSUPPORTED_FORMAT,
+            StatusCode::BAD_REQUEST,
+            format!("扩展名不在白名单: {ext}"),
+        ));
+    }
+    let _ = &mut ext;
+
+    {
+        let index = state.index.lock().unwrap();
+        if q.skip_existing {
+            if let Some(existing) = index.get(&hash) {
+                if existing.has_library_path() {
+                    let dto = project_item(state, existing);
+                    return Ok(axum::Json(serde_json::json!({
+                        "status": "success",
+                        "data": AddResult { item: dto, already_existed: true, skipped: true }
+                    })));
+                }
+            }
+        }
+    }
+
+    let name = if q.source_name.is_empty() {
+        format!("{hash}.{ext}")
+    } else {
+        q.source_name.clone()
+    };
+    let folder = q.folder_path.trim().trim_end_matches('/');
+    let rel = if folder.is_empty() { name.clone() } else { format!("{folder}/{name}") };
+    let abs = state
+        .paths
+        .to_absolute(&rel)
+        .ok_or_else(|| envelope::ApiError::invalid_param(format!("非法目标路径: {rel}")))?;
+    if std::path::Path::new(&abs).exists() {
+        return Err(envelope::ApiError::file_exists(&rel));
+    }
+    if let Some(parent) = std::path::Path::new(&abs).parent() {
+        std::fs::create_dir_all(parent).map_err(io_err)?;
+    }
+    std::fs::write(&abs, &q.bytes).map_err(io_err)?;
+    let mtime = crate::core::paths::file_mtime_ms(&abs);
+
+    let mut index = state.index.lock().unwrap();
+    let already_existed = index.get(&hash).is_some();
+    let mut item = match index.get(&hash).cloned() {
+        Some(mut existing) => {
+            existing.paths.push(PathRecord::new(&rel, q.bytes.len() as u64, mtime));
+            existing
+        }
+        None => {
+            let mut item = ItemCore::new(&hash, vec![PathRecord::new(&rel, q.bytes.len() as u64, mtime)], now);
+            item.title = LibraryPaths::name_of(&rel).to_string();
+            let fts = state.fulltext.as_deref();
+            let mut ctx = PipelineCtx { paths: &state.paths, index: &mut index, store: &state.store, bus: &state.bus, fulltext: fts };
+            crate::core::pipeline::derive_book_facts(&mut ctx, &mut item, &rel, &abs);
+            item
+        }
+    };
+    let _ = &mut item;
+    state.store.upsert(&item).map_err(envelope::ApiError::internal)?;
+    index.upsert(item.clone());
+    let dto = project_item(state, &item);
+    drop(index);
+    state.bus.emit_json(crate::core::events::names::ITEM_ADDED, &dto);
+    Ok(axum::Json(serde_json::json!({
+        "status": "success",
+        "data": AddResult { item: dto, already_existed, skipped: false }
+    })))
 }

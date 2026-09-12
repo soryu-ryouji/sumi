@@ -11,9 +11,14 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 pub mod app;
+#[cfg(test)]
+mod contract_tests;
 pub mod envelope;
 pub mod events;
+pub mod folder;
 pub mod item;
+pub mod misc;
+pub mod taxonomy;
 
 /// 请求级扩展：当前 token 的访问级别，app/info 据此报告。
 /// Viewer 携带该 token 的写能力（[web] 的 writable/separate/write_token 共同决定，每请求解析，配置热生效）
@@ -71,6 +76,9 @@ pub fn api_router() -> (axum::Router<SharedState>, utoipa::openapi::OpenApi) {
         .merge(app::routes())
         .merge(events::routes())
         .merge(item::routes())
+        .merge(folder::routes())
+        .merge(taxonomy::routes())
+        .merge(misc::routes())
         .split_for_parts()
 }
 

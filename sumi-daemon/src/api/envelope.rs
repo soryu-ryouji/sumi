@@ -14,6 +14,7 @@ pub mod codes {
     pub const UNSUPPORTED_FORMAT: &str = "UNSUPPORTED_FORMAT";
     pub const CATEGORY_NOT_FOUND: &str = "CATEGORY_NOT_FOUND";
     pub const CATEGORY_EXISTS: &str = "CATEGORY_EXISTS";
+    pub const TAG_EXISTS_FALLBACK: &str = "TAG_EXISTS";
     pub const TAG_NOT_FOUND: &str = "TAG_NOT_FOUND";
     pub const AUTHOR_NOT_FOUND: &str = "AUTHOR_NOT_FOUND";
     pub const SERIES_NOT_FOUND: &str = "SERIES_NOT_FOUND";

@@ -1,6 +1,6 @@
-# sumi-daemon（Rust 实现，规划）
+# sumi-daemon（Rust 实现）
 
-> 本文为实现蓝图：接口契约定稿后按此启动开发。
+> v1 已按本文实现（单测 + `tools/smoke.sh` 行为冒烟全绿）。「已知简化」一节记录待打磨项。
 > API 契约见 [REST API V1](server-rest-api-v1.md)，存储格式见 [storage.md](storage.md)，全文检索设计见 [fulltext-search.md](fulltext-search.md)，进程模型见 [architecture.md](../architecture.md)。
 
 sumi 书籍管理后端，Rust 实现（`sumi-daemon/`）。
@@ -94,7 +94,17 @@ SUMI_TOKEN=<token> sumi-daemon --library <书库路径> --port 27381 [--web-dist
 
 `SUMI_TOKEN` 为 admin token（桌面端全权），只存在于进程环境变量、不落盘；viewer token（`[web]`）在 `.sumi/config.toml` 中，由 daemon 权威写入。
 
-## 构建与测试规划
+## 已知简化（v1 后续打磨）
+
+- 解析派生（封面/元数据/FTS）在流水线内同步执行；worker 化（`CPU/4` 封顶 8 的 cover 队列）与 `task.progress` 的 500ms 节流推送待接入
+- pdf 解析未实现（pdfium 首页渲染/书签依赖动态库，打包阶段处理）：封面 404 占位 + toc 空数组，阅读走 `item/file` + pdf.js
+- `item/content` 的 epub/docx 归一化为段落级 HTML（锚点占位注入；资源引用逐属性改写与章节锚点精确对位待增强）；mobi 直出解包内容
+- watcher 的 rename 事件按 remove+add 防抖处理（周期扫描兜底收敛）；From/To 精确配对待加
+- `app/lan` 的监听 supervisor（`[web]` 热重绑）待接线：配置读写契约已完整
+- `index.db` 元数据镜像（大库启动加速）未接：注水直接读权威层
+- mobi crate 实际版本 0.8（0.11 不存在）
+
+## 构建与测试
 
 ```bash
 cd sumi-daemon
@@ -103,7 +113,6 @@ cargo test                     # 解析器单测（testdata/ 样例书）+ 流�
 ```
 
 - **testdata/**：每格式准备最小样例书（含中英文混合、多卷、无封面、损坏文件等边界样例），解析器单测逐格式覆盖
-- **tools/smoke.sh**：端到端冒烟（启动 → 导入 → 查询 → 事件），行为契约测试
-- **tools/bench-\*.py**：性能压测（启动就绪 / 入库吞吐 / 查询延迟 / 大库全链路），改代码前后各跑一次对比；性能基线在首次实现后固化进本文档
-
+- **tools/smoke.sh**：端到端冒烟（18 项行为断言：鉴权/入库/全文/封面/Range/用户编辑保护/分类/锁票据/回收站/文件夹/view/global_filter/rescan/存储迁移/SSE）
+- **契约测试**：`openapi.json` 固化文件与代码生成 schema 逐字一致（改 API 后 `cargo run -- --dump-openapi > openapi.json` 重新固化）
 PDFium 为 C++ 依赖：pdfium-render 随 crate 携带各平台预编译动态库（`pdfium-build` feature），无需本地工具链；打包时随 extraResources 分发。

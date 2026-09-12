@@ -10,14 +10,19 @@
 
 ## 当前状态
 
-**API 先行**：仓库处于 API 设计阶段，实现待接口契约定稿后启动。
+**sumi-daemon v1 已实现**（REST API V1 全端点 + SSE + 索引流水线 + 格式解析 + FTS5 全文检索；`cargo test` 与 `tools/smoke.sh` 全绿）。桌面客户端待启动。
 
 - [架构设计](docs/architecture.md)：进程模型、核心原则、部署形态
 - [REST API V1](docs/backend/server-rest-api-v1.md)：接口定义
 - [存储设计](docs/backend/storage.md)：`.sumi/` 目录结构、同步边界、元数据与封面存储
 - [全文检索设计](docs/backend/fulltext-search.md)：FTS5 中文分词与查询映射
-- [技术栈](docs/tech-stack.md)：选型规划
-- [sumi-daemon 实现蓝图](docs/backend/server-rust.md)：Rust 后端实现规划
+- [技术栈](docs/tech-stack.md)：选型
+- [sumi-daemon](docs/backend/server-rust.md)：Rust 后端（实现说明与已知简化）
+
+```bash
+cd sumi-daemon && cargo build --release
+bash tools/smoke.sh          # 端到端冒烟（18 项行为断言）
+```
 
 ## 核心设计（与 hawk 一致）
 
@@ -64,7 +69,7 @@ POST http://localhost:27381/api/v1/item/update
 ## 路线图
 
 - 1.0 版本
-  - [ ] 实现 sumi-daemon（REST API V1）
+  - [x] 实现 sumi-daemon（REST API V1，`sumi-daemon/`）
   - [ ] 实现 Windows, macOS, Linux 桌面客户端
   - [ ] 实现 web 书库查看器：局域网内通过浏览器访问书库
 - 2.0 版本

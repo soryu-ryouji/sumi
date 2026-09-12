@@ -1,6 +1,7 @@
 //! app 端点组：info / startup / status / token（lan 待 LanSupervisor 就位后并入）。
 
 use crate::api::{envelope, AccessLevel, SharedState};
+use serde::Deserialize;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -221,4 +222,106 @@ pub fn routes() -> utoipa_axum::router::OpenApiRouter<crate::api::SharedState> {
         .routes(utoipa_axum::routes!(startup))
         .routes(utoipa_axum::routes!(status))
         .routes(utoipa_axum::routes!(discover_token))
+        .routes(utoipa_axum::routes!(lan_get))
+        .routes(utoipa_axum::routes!(lan_put))
+}
+
+// ---------- app/lan：局域网 web 查看配置读写（admin 限定） ----------
+// 监听重绑（LanSupervisor 热重绑）列为后续项：当前 [web] 配置读写契约完整，
+// 实际 0.0.0.0 监听在桌面端打包阶段随 web-dist 托管一并接线
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct LanConfig {
+    pub enabled: bool,
+    pub port: u16,
+    pub token: String,
+    pub writable: bool,
+    pub separate_write_token: bool,
+    pub write_token: String,
+    pub active: bool,
+}
+
+fn lan_snapshot(state: &crate::api::AppState) -> LanConfig {
+    let web = state.config.current().web;
+    LanConfig {
+        enabled: web.enabled,
+        port: web.port,
+        token: web.token,
+        writable: web.writable,
+        separate_write_token: web.separate_write_token,
+        write_token: web.write_token,
+        active: false, // supervisor 接线前恒 false（契约字段保留）
+    }
+}
+
+/// `GET /api/v1/app/lan`：读取 [web] 配置（admin 限定；viewer 拿到 write_token 即提权）
+#[utoipa::path(get, path = "/api/v1/app/lan", tags = ["app"],
+    responses((status = 200, description = "OK", body = envelope::Envelope<LanConfig>)))]
+pub async fn lan_get(
+    State(state): State<SharedState>,
+    axum::Extension(access): axum::Extension<AccessLevel>,
+) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
+    require_admin(access)?;
+    Ok(axum::Json(serde_json::json!({
+        "status": "success",
+        "data": lan_snapshot(&state)
+    })))
+}
+
+fn require_admin(access: AccessLevel) -> Result<(), envelope::ApiError> {
+    match access {
+        AccessLevel::Admin => Ok(()),
+        AccessLevel::Viewer { .. } => Err(envelope::ApiError::new(
+            envelope::codes::READ_ONLY,
+            StatusCode::FORBIDDEN,
+            "admin required",
+        )),
+    }
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct LanPut {
+    pub enabled: bool,
+    pub port: u16,
+    pub token: String,
+    pub writable: bool,
+    pub separate_write_token: bool,
+    pub write_token: String,
+}
+
+/// `PUT /api/v1/app/lan`：写回 [web] 配置（校验 + toml_edit 保注释写回；失败不落盘）
+#[utoipa::path(put, path = "/api/v1/app/lan", tags = ["app"],
+    request_body = LanPut, responses((status = 200, description = "OK", body = envelope::Envelope<LanConfig>)))]
+pub async fn lan_put(
+    State(state): State<SharedState>,
+    axum::Extension(access): axum::Extension<AccessLevel>,
+    envelope::JsonBody(body): envelope::JsonBody<LanPut>,
+) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
+    require_admin(access)?;
+    if !(1..=65535).contains(&body.port) {
+        return Err(envelope::ApiError::invalid_param("端口 1-65535"));
+    }
+    if body.enabled && body.token.trim().is_empty() {
+        return Err(envelope::ApiError::invalid_param("enabled 时 token 必填"));
+    }
+    if body.writable && body.separate_write_token && body.write_token.trim().is_empty() {
+        return Err(envelope::ApiError::invalid_param("拆分写 token 时 write_token 必填"));
+    }
+    state
+        .config
+        .edit(|doc| {
+            let web = &mut doc["web"];
+            web["enabled"] = toml_edit::value(body.enabled);
+            web["port"] = toml_edit::value(body.port as i64);
+            web["token"] = toml_edit::value(body.token.trim());
+            web["writable"] = toml_edit::value(body.writable);
+            web["separate_write_token"] = toml_edit::value(body.separate_write_token);
+            web["write_token"] = toml_edit::value(body.write_token.trim());
+            Ok(())
+        })
+        .map_err(envelope::ApiError::internal)?;
+    Ok(axum::Json(serde_json::json!({
+        "status": "success",
+        "data": lan_snapshot(&state)
+    })))
 }
