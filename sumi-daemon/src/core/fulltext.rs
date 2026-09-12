@@ -7,8 +7,10 @@
 
 use rusqlite::Connection;
 
+/// 连接非 Sync（RefCell），跨线程传递与共享经 Mutex 包装（FTS 写路径全部在
+/// 流水线消费循环/扫描 runner 内串行，读路径在查询线程，锁粒度足够）
 pub struct FulltextIndex {
-    conn: Connection,
+    conn: std::sync::Mutex<Connection>,
 }
 
 /// CJK 判定：统一表意文字及扩展 A–G（覆盖中日韩汉字全集的实用近似）
@@ -110,26 +112,27 @@ impl FulltextIndex {
             );",
         )
         .map_err(|e| format!("fts 表创建失败: {e}"))?;
-        Ok(FulltextIndex { conn })
+        Ok(FulltextIndex { conn: std::sync::Mutex::new(conn) })
     }
 
     /// 写入/更新一条正文（预分词后入倒排）
     pub fn upsert(&self, item_id: &str, text: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
         let tokenized = pre_tokenize(text);
-        self.conn
-            .execute("DELETE FROM fts WHERE item_id = ?1", [item_id])
+        conn.execute("DELETE FROM fts WHERE item_id = ?1", [item_id])
             .map_err(|e| e.to_string())?;
-        self.conn
-            .execute(
-                "INSERT INTO fts (item_id, text) VALUES (?1, ?2)",
-                rusqlite::params![item_id, tokenized],
-            )
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO fts (item_id, text) VALUES (?1, ?2)",
+            rusqlite::params![item_id, tokenized],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn remove(&self, item_id: &str) -> Result<(), String> {
         self.conn
+            .lock()
+            .unwrap()
             .execute("DELETE FROM fts WHERE item_id = ?1", [item_id])
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -140,8 +143,8 @@ impl FulltextIndex {
         let Some(expr) = build_match_expr(query) else {
             return Ok(Vec::new());
         };
-        let mut stmt = self
-            .conn
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
             .prepare("SELECT item_id FROM fts WHERE fts MATCH ?1")
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -150,9 +153,29 @@ impl FulltextIndex {
         Ok(rows.flatten().collect())
     }
 
+    /// id 漂移迁移：正文随 item 搬家（预分词文本直接搬运，无需重新提取）
+    pub fn migrate(&self, old_id: &str, new_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let text: Option<String> = conn
+            .query_row("SELECT text FROM fts WHERE item_id = ?1", [old_id], |row| row.get(0))
+            .ok();
+        if let Some(text) = text {
+            conn.execute("DELETE FROM fts WHERE item_id = ?1", [old_id])
+                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT INTO fts (item_id, text) VALUES (?1, ?2)",
+                rusqlite::params![new_id, text],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     /// 正文是否已索引（补缺失模式判定）
     pub fn contains(&self, item_id: &str) -> bool {
         self.conn
+            .lock()
+            .unwrap()
             .query_row("SELECT 1 FROM fts WHERE item_id = ?1", [item_id], |_| Ok(()))
             .is_ok()
     }

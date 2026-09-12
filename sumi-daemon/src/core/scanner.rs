@@ -64,12 +64,14 @@ pub fn scan_library(paths: &LibraryPaths, config: &LibraryConfigSnapshot) -> std
 
 /// 与内存索引比对并应用差异（启动扫描与运行期重扫共用）。
 /// progress 回调按阶段上报；startup 为 StartupState，运行期为 TaskTracker
+#[allow(clippy::too_many_arguments)]
 pub fn reconcile_with_index(
     paths: &LibraryPaths,
     config: &LibraryConfigSnapshot,
     index: &mut ItemIndex,
     store: &MetadataStore,
     bus: &crate::core::events::EventBus,
+    fulltext: Option<&crate::core::fulltext::FulltextIndex>,
     progress: &dyn Fn(Phase, u64, u64),
 ) -> ScanStats {
     let started = Instant::now();
@@ -111,7 +113,7 @@ pub fn reconcile_with_index(
     // 并行化优化留待压测后引入——正确性优先，语义与单写者模型一致）
     let total = to_process.len() as u64;
     let mut applied = 0u64;
-    let mut ctx = PipelineCtx { paths, index, store, bus };
+    let mut ctx = PipelineCtx { paths, index, store, bus, fulltext };
     for (rel, size, mtime) in &to_process {
         progress(Phase::Hash, applied, total);
         if apply_file_fact(&mut ctx, rel, *size, *mtime).is_some() {
@@ -152,6 +154,7 @@ pub fn periodic_rescan_loop(
     shared: Arc<std::sync::Mutex<ItemIndex>>,
     store: Arc<MetadataStore>,
     bus: crate::core::events::EventBus,
+    fulltext: Option<std::sync::Arc<crate::core::fulltext::FulltextIndex>>,
     tasks: Arc<TaskTracker>,
     startup: Arc<StartupState>,
 ) {
@@ -174,6 +177,7 @@ pub fn periodic_rescan_loop(
                 &mut index,
                 &store,
                 &bus,
+                fulltext.as_deref(),
                 &|_phase, _p, _t| {},
             );
             tasks.finish_scan(stats);

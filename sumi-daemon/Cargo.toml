@@ -36,6 +36,12 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 async-stream = "0.3"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-axum = "0.2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.37"
+chardetng = "0.1"
+encoding_rs = "0.8"
+mobi = "0.8"
+ab_glyph = "0.2"
 
 [profile.release]
 lto = true

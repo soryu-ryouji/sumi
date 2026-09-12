@@ -29,6 +29,11 @@ pub async fn run(settings: Settings) {
 
     let config = Arc::new(LibraryConfig::load(&paths.config_file));
     let store = Arc::new(MetadataStore::open(paths.clone()));
+    // 全文索引（库外缓存 index.db；打开失败只退化全文检索，不阻断启动）
+    let fulltext = crate::core::fulltext::FulltextIndex::open(&paths.index_db_file)
+        .map(Arc::new)
+        .map_err(|e| tracing::warn!("全文索引不可用: {e}"))
+        .ok();
     let index = Arc::new(Mutex::new(ItemIndex::new()));
     let startup = Arc::new(StartupState::new());
     let tasks = Arc::new(TaskTracker::new());
@@ -78,6 +83,7 @@ pub async fn run(settings: Settings) {
         let bus = bus.clone();
         let startup = startup.clone();
         let tasks = tasks.clone();
+        let fulltext_for_scan = fulltext.clone();
         std::thread::spawn(move || {
             // sync：注水（缓存快路径在 S5 接 index.db 后启用，当前全量读权威层）
             hydrate_from_store(&store, &mut index.lock().unwrap(), &startup);
@@ -89,6 +95,7 @@ pub async fn run(settings: Settings) {
                 &mut index.lock().unwrap(),
                 &store,
                 &bus,
+                fulltext_for_scan.as_deref(),
                 &|phase: Phase, processed, total| {
                     let name = match phase {
                         Phase::Sync => "sync",
@@ -112,6 +119,7 @@ pub async fn run(settings: Settings) {
         config: config.clone(),
         index: index.clone(),
         store: store.clone(),
+        fulltext: fulltext.clone(),
         bus: bus.clone(),
         categories: state.categories.clone(),
         tags: state.tags.clone(),
@@ -119,7 +127,7 @@ pub async fn run(settings: Settings) {
         global_filter: state.global_filter.clone(),
         locks: state.locks.clone(),
     });
-    periodic_rescan_loop(paths, config, index, store, bus, tasks, startup);
+    periodic_rescan_loop(paths, config, index, store, bus, fulltext, tasks, startup);
 
     axum::serve(listener, app).await.expect("HTTP 服务异常退出");
 }

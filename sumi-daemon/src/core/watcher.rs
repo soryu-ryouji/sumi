@@ -21,6 +21,7 @@ pub struct WatchDeps {
     pub config: Arc<LibraryConfig>,
     pub index: Arc<std::sync::Mutex<ItemIndex>>,
     pub store: Arc<MetadataStore>,
+    pub fulltext: Option<Arc<crate::core::fulltext::FulltextIndex>>,
     pub bus: crate::core::events::EventBus,
     pub categories: Arc<NameRegistry>,
     pub tags: Arc<NameRegistry>,
@@ -36,6 +37,7 @@ pub fn spawn_watcher(deps: WatchDeps) {
         config,
         index,
         store,
+        fulltext,
         bus,
         categories,
         tags,
@@ -81,7 +83,7 @@ pub fn spawn_watcher(deps: WatchDeps) {
                 }
             }
             let batch = std::mem::take(&mut pending);
-            handle_batch(&paths, &config, &index, &store, &bus, &categories, &tags, &prefs, &global_filter, &locks, &batch);
+            handle_batch(&paths, &config, &index, &store, fulltext.as_deref(), &bus, &categories, &tags, &prefs, &global_filter, &locks, &batch);
         }
     });
 }
@@ -92,6 +94,7 @@ fn handle_batch(
     config: &Arc<LibraryConfig>,
     index: &Arc<std::sync::Mutex<ItemIndex>>,
     store: &Arc<MetadataStore>,
+    fulltext: Option<&crate::core::fulltext::FulltextIndex>,
     bus: &crate::core::events::EventBus,
     categories: &Arc<NameRegistry>,
     tags: &Arc<NameRegistry>,
@@ -157,7 +160,7 @@ fn handle_batch(
                             if meta.is_file() {
                                 let mtime = crate::core::paths::file_mtime_ms(&abs_ok);
                                 let mut index = index.lock().unwrap();
-                                let mut ctx = PipelineCtx { paths, index: &mut index, store, bus };
+                                let mut ctx = PipelineCtx { paths, index: &mut index, store, bus, fulltext };
                                 apply_file_fact(&mut ctx, &rel, meta.len(), mtime);
                                 fs_changed = true;
                             }
@@ -169,7 +172,7 @@ fn handle_batch(
                     // 文件消失直接摘位置（后续周期扫描兜底漏事件）
                     if is_file_like {
                         let mut index = index.lock().unwrap();
-                        let mut ctx = PipelineCtx { paths, index: &mut index, store, bus };
+                        let mut ctx = PipelineCtx { paths, index: &mut index, store, bus, fulltext: None };
                         apply_path_removed(&mut ctx, &rel);
                         fs_changed = true;
                     } else {

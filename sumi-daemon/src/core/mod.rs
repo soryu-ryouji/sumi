@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod fulltext;
+pub mod cover;
 pub mod index;
 pub mod item;
 pub mod locks;
@@ -11,6 +12,7 @@ pub mod metadata_store;
 pub mod tasks;
 pub mod events;
 pub mod paths;
+pub mod parser;
 pub mod pipeline;
 pub mod scanner;
 pub mod watcher;

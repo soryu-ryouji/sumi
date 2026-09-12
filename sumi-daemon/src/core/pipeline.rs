@@ -14,6 +14,7 @@ pub struct PipelineCtx<'a> {
     pub index: &'a mut ItemIndex,
     pub store: &'a MetadataStore,
     pub bus: &'a crate::core::events::EventBus,
+    pub fulltext: Option<&'a crate::core::fulltext::FulltextIndex>,
 }
 
 /// 计算文件 BLAKE3 哈希（hex）
@@ -68,8 +69,8 @@ pub fn apply_file_fact(
                 Some(new_hash)
             } else {
                 let mut item = ItemCore::new(&new_hash, vec![PathRecord::new(rel, size, mtime)], now);
-                // TODO(S6)：解析任务派发（封面/书目元数据/全文索引）回填 title/authors/cover_*
-                item.title = LibraryPaths::name_of(rel).to_string();
+                // 解析回填：一次打开文件产出书目元数据 + 封面 + 全文（契约：扫描导入即时提取）
+                derive_book_facts(ctx, &mut item, rel, &abs);
                 persist_and_upsert(ctx, item);
                 emit_item_added(ctx, &new_hash);
                 Some(new_hash)
@@ -122,6 +123,7 @@ fn migrate_id_drift(
         moved.paths = vec![PathRecord::new(rel, size, mtime)];
         moved.added_time = if moved.added_time == 0 { now } else { moved.added_time };
         migrate_custom_cover(ctx, old_id, new_hash);
+        migrate_derived(ctx, old_id, new_hash);
         ctx.store.delete(old_id).ok();
         persist_and_upsert(ctx, moved);
         ctx.bus.emit(names::ITEM_REMOVED, serde_json::json!({ "id": old_id }));
@@ -132,6 +134,7 @@ fn migrate_id_drift(
         let mut copied = old_item.clone();
         copied.id = new_hash.to_string();
         copied.paths = vec![PathRecord::new(rel, size, mtime)];
+        migrate_derived(ctx, old_id, new_hash);
         persist_and_upsert(ctx, copied);
         emit_item_added(ctx, new_hash);
         // H 的该位置记录移除（位置改属 X）
@@ -201,6 +204,9 @@ pub fn drop_item(ctx: &mut PipelineCtx, id: &str) {
     let _ = std::fs::remove_file(format!("{}/{id}.webp", ctx.paths.covers_dir));
     let _ = std::fs::remove_file(format!("{}/{id}.webp", ctx.paths.cache_covers_dir));
     let _ = std::fs::remove_file(format!("{}/{id}.html", ctx.paths.cache_content_dir));
+    if let Some(fts) = ctx.fulltext {
+        let _ = fts.remove(id);
+    }
 }
 
 fn refresh_path_record(ctx: &mut PipelineCtx, item: &ItemCore, rel: &str, size: u64, mtime: i64) -> bool {
@@ -217,6 +223,78 @@ fn refresh_path_record(ctx: &mut PipelineCtx, item: &ItemCore, rel: &str, size: 
         persist_and_upsert(ctx, updated);
     }
     changed
+}
+
+/// 解析派生：书目元数据回填（尊重用户编辑）+ 封面提取/生成落缓存 + 尺寸回填 + FTS 写入。
+/// v1 为同步内联（正确性优先）；worker 化（CPU/4 封顶 8）在性能打磨阶段引入
+fn derive_book_facts(ctx: &mut PipelineCtx, item: &mut ItemCore, rel: &str, abs: &str) {
+    let name = LibraryPaths::name_of(rel).to_string();
+    let ext = LibraryPaths::ext_of(rel);
+    let bytes = match std::fs::read(abs) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("读取失败 {rel}: {e}");
+            item.title = name;
+            return;
+        }
+    };
+    let parsed = crate::core::parser::parse(&name, &ext, &bytes);
+    crate::core::parser::apply_to_item(item, &parsed);
+    if item.title.trim().is_empty() {
+        item.title = name;
+    }
+
+    // 封面：提取链（解码→缩放→webp）或排版生成（txt/md/docx）
+    let cover_path = crate::core::cover::cache_cover_path(&ctx.paths.cache_covers_dir, &item.id);
+    if !std::path::Path::new(&cover_path).exists() {
+        let generated: Option<(Vec<u8>, u32, u32)> = parsed
+            .cover
+            .as_deref()
+            .and_then(crate::core::cover::process_cover)
+            .or_else(|| {
+                if crate::core::cover::can_generate_cover(&ext) {
+                    let (bytes, w, h) =
+                        crate::core::cover::generated_cover(&item.title, &item.authors);
+                    Some((bytes, w, h))
+                } else {
+                    None
+                }
+            });
+        if let Some((bytes, w, h)) = generated {
+            if !bytes.is_empty() {
+                if let Err(e) = crate::core::config::atomic_write(&cover_path, &bytes) {
+                    tracing::warn!("封面缓存写入失败 {rel}: {e}");
+                } else {
+                    item.cover_width = w;
+                    item.cover_height = h;
+                }
+            }
+        }
+    }
+
+    // 全文索引（txt/md/epub/docx）
+    if let (Some(text), Some(fts)) = (&parsed.fulltext, ctx.fulltext) {
+        if let Err(e) = fts.upsert(&item.id, text) {
+            tracing::warn!("全文索引写入失败 {rel}: {e}");
+        }
+    }
+}
+
+/// 派生缓存迁移：自动封面 + 归一化内容 + FTS（id 漂移随迁）
+fn migrate_derived(ctx: &PipelineCtx, old_id: &str, new_id: &str) {
+    let from = crate::core::cover::cache_cover_path(&ctx.paths.cache_covers_dir, old_id);
+    let to = crate::core::cover::cache_cover_path(&ctx.paths.cache_covers_dir, new_id);
+    if std::path::Path::new(&from).exists() {
+        let _ = std::fs::rename(&from, &to);
+    }
+    let from_content = format!("{}/{old_id}.html", ctx.paths.cache_content_dir);
+    let to_content = format!("{}/{new_id}.html", ctx.paths.cache_content_dir);
+    if std::path::Path::new(&from_content).exists() {
+        let _ = std::fs::rename(&from_content, &to_content);
+    }
+    if let Some(fts) = ctx.fulltext {
+        let _ = fts.migrate(old_id, new_id);
+    }
 }
 
 fn migrate_custom_cover(ctx: &PipelineCtx, old_id: &str, new_id: &str) {
