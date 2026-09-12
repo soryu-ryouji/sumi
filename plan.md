@@ -9,7 +9,7 @@
 - [x] S2 core 数据模型：Item（含 paths 多位置、回收站派生、用户编辑字段集合）、LibraryInfo、存储模式探测（storage_mode 标记优先）
 - [x] S3 元数据存储：数据库模式（metadata.db，rusqlite）、配置文件模式（metadata/*.toml 原子写 + 冲突副本忽略）、注册表文件（categories/tags/view/global_filter/locks + config.toml 模板生成与监听重载）
 - [x] S4 内存索引 + 索引流水线：Job 有界队列、单写者消费循环、watcher（notify）、扫描 runner（startup 四阶段 sync/scan/hash/apply + 运行期周期重扫）、id 漂移迁移（移动/复制/去重三分支）
-- [ ] S5 派生缓存 index.db：元数据镜像（source_mtime 对账）+ FTS5（sumi_tokenizer 自定义分词 + 查询映射）、缓存目录管理（<库标识>、--cache-parent）
+- [x] S5 FTS5 全文检索：core/fulltext.rs（预分词+unicode61 实现「CJK 单字+西文词」，子串=短语邻接、多关键词 AND、引号短语、注入防护、纯标点忽略）；fulltext-search.md 实现说明已同步。**未完**：元数据镜像（source_mtime 对账）与流水线接线（入库时提取正文写 fts、id 漂移随迁、content 参数查询），随 S7 一并做
 - [ ] S6 解析器：txt/md（编码探测 chardetng）、epub（zip+quick-xml：OPF/NCX/nav、封面、XHTML 拼接+锚点注入+资源改写）、docx（core.xml+document.xml）、pdf（pdfium-render 首页+书签）、cbz（zip 首图）、mobi/azw3（EXTH 元数据+封面；KF8 正文尽力）；排版封面生成（txt/md/docx 书名+作者）；webp 封面管线
 - [ ] S7 item API 组：list/skeleton/aggregate/detail/count/add/upload/update/batch_update/delete/restore/cover(GET/PUT/DELETE)/file(Range)/open/show_in_folder/toc/content/resource/refresh_metadata
 - [ ] S8 其余 API：folder/category/tag/author/series/view/global_filter/lock/trash/library（info/scan/reindex/rescan/refresh_cache/cleanup_index/storage_mode）+ app/lan
