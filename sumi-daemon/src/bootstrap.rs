@@ -55,6 +55,7 @@ pub async fn run(settings: Settings) {
         sse_lagged: Arc::new(AtomicU64::new(0)),
         index: index.clone(),
         store: store.clone(),
+        fulltext: fulltext.clone(),
         categories,
         tags,
         prefs,

@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub mod app;
 pub mod envelope;
 pub mod events;
+pub mod item;
 
 /// 请求级扩展：当前 token 的访问级别，app/info 据此报告。
 /// Viewer 携带该 token 的写能力（[web] 的 writable/separate/write_token 共同决定，每请求解析，配置热生效）
@@ -37,6 +38,8 @@ pub struct AppState {
     // ---- 索引与存储（写路径经 Mutex<ItemIndex> 单写者）----
     pub index: Arc<std::sync::Mutex<crate::core::index::ItemIndex>>,
     pub store: Arc<crate::core::metadata_store::MetadataStore>,
+    /// 全文索引（打开失败为 None：查询退化不命中，可重建）
+    pub fulltext: Option<Arc<crate::core::fulltext::FulltextIndex>>,
     // ---- 注册表 ----
     pub categories: Arc<crate::core::registry_file::NameRegistry>,
     pub tags: Arc<crate::core::registry_file::NameRegistry>,
@@ -67,6 +70,7 @@ pub fn api_router() -> (axum::Router<SharedState>, utoipa::openapi::OpenApi) {
     utoipa_axum::router::OpenApiRouter::new()
         .merge(app::routes())
         .merge(events::routes())
+        .merge(item::routes())
         .split_for_parts()
 }
 
@@ -168,7 +172,100 @@ async fn auth(
     }
 
     req.extensions_mut().insert(access);
+
+    // 解锁票据 → 已解锁集合（X-Sumi-Unlock 头；直链端点放行 ?unlock= 查询参数，通道与 token 一致）
+    let mut tickets = Vec::new();
+    if let Some(hv) = req.headers().get("x-sumi-unlock") {
+        if let Ok(v) = hv.to_str() {
+            tickets.extend(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string));
+        }
+    }
+    let allow_query_unlock = matches!(
+        req.uri().path(),
+        "/api/v1/events"
+            | "/api/v1/item/cover"
+            | "/api/v1/item/file"
+            | "/api/v1/item/toc"
+            | "/api/v1/item/content"
+            | "/api/v1/item/resource"
+    );
+    if allow_query_unlock {
+        if let Some(query) = req.uri().query() {
+            for pair in query.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    if k == "unlock" {
+                        tickets.extend(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string));
+                    }
+                }
+            }
+        }
+    }
+    let unlocked = state.locks.unlocked_dimensions(&tickets);
+    req.extensions_mut().insert(LockView {
+        all: state.locks.snapshot_names(),
+        unlocked,
+    });
     next.run(req).await
+}
+
+/// 请求级锁视野：未解锁锁的排除判定（列表过滤与内容直连共用）。
+/// all = 全部锁集合，unlocked = 本请求票据已解锁集合；locked = all 中未解锁部分
+#[derive(Clone)]
+pub struct LockView {
+    pub all: crate::core::registry_file::DimensionSet,
+    pub unlocked: crate::core::registry_file::DimensionSet,
+}
+
+impl LockView {
+    fn named_locked(&self, dimension: &str, name: &str) -> bool {
+        self.all.named_contains(dimension, name) && !self.unlocked.named_contains(dimension, name)
+    }
+
+    fn folder_locked(&self, path: &str) -> bool {
+        self.all.folder_hit(path) && !self.unlocked.folder_hit(path)
+    }
+
+    pub fn has_any_locks(&self) -> bool {
+        !(self.all.folders.is_empty()
+            && self.all.categories.is_empty()
+            && self.all.tags.is_empty()
+            && self.all.authors.is_empty())
+    }
+
+    /// 条目是否被未解锁的锁覆盖（OR 剔除：命中任一未解锁锁即不可见。
+    /// 位置维度：存在任一无锁或已解锁的非回收站位置即放行；属性维度与位置无关）
+    pub fn hides_item(&self, item: &crate::core::item::ItemCore) -> bool {
+        if !self.has_any_locks() {
+            return false;
+        }
+        // 属性维度（分类/标签/作者）与位置无关
+        if item.categories.iter().any(|c| self.named_locked("category", c))
+            || item.tags.iter().any(|t| self.named_locked("tag", t))
+            || item.authors.iter().any(|a| self.named_locked("author", a))
+        {
+            return true;
+        }
+        // 位置维度：任一非回收站位置「无锁或已解锁」即放行
+        let library_paths: Vec<&str> = item
+            .paths
+            .iter()
+            .filter(|p| !crate::core::paths::LibraryPaths::is_in_trash(&p.path))
+            .map(|p| p.path.as_str())
+            .collect();
+        if library_paths.is_empty() {
+            return false; // 回收站视图不排除锁
+        }
+        library_paths.iter().all(|p| self.folder_locked(p))
+    }
+
+    /// 主动筛选目标是否命中未解锁锁（item/list 的 folders/categories/tags/authors 参数 → 403）
+    pub fn filter_locked(&self, dimension: &str, name: &str) -> bool {
+        if dimension == "folder" {
+            self.folder_locked(name)
+        } else {
+            self.named_locked(dimension, name)
+        }
+    }
 }
 
 /// 返回 access 级别（含 viewer 的 per-token 写能力），token 无效返回 None

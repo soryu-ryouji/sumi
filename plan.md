@@ -11,9 +11,18 @@
 - [x] S4 内存索引 + 索引流水线：Job 有界队列、单写者消费循环、watcher（notify）、扫描 runner（startup 四阶段 sync/scan/hash/apply + 运行期周期重扫）、id 漂移迁移（移动/复制/去重三分支）
 - [x] S5 FTS5 全文检索：core/fulltext.rs（预分词+unicode61 实现「CJK 单字+西文词」，子串=短语邻接、多关键词 AND、引号短语、注入防护、纯标点忽略）；fulltext-search.md 实现说明已同步。**未完**：元数据镜像（source_mtime 对账）与流水线接线（入库时提取正文写 fts、id 漂移随迁、content 参数查询），随 S7 一并做
 - [x] S6 解析器：txt/md（编码探测 chardetng）、epub（zip+quick-xml：OPF/NCX/nav、封面、XHTML 拼接+锚点注入+资源改写）、docx（core.xml+document.xml）、pdf（pdfium-render 首页+书签）、cbz（zip 首图）、mobi/azw3（EXTH 元数据+封面；KF8 正文尽力）；排版封面生成（txt/md/docx 书名+作者）；webp 封面管线
-- [ ] S7 item API 组：list/skeleton/aggregate/detail/count/add/upload/update/batch_update/delete/restore/cover(GET/PUT/DELETE)/file(Range)/open/show_in_folder/toc/content/resource/refresh_metadata
+- [ ] S7 item API 组（读路径已完成，写路径待做）：list/skeleton/aggregate/detail/count/add/upload/update/batch_update/delete/restore/cover(GET/PUT/DELETE)/file(Range)/open/show_in_folder/toc/content/resource/refresh_metadata
 - [ ] S8 其余 API：folder/category/tag/author/series/view/global_filter/lock/trash/library（info/scan/reindex/rescan/refresh_cache/cleanup_index/storage_mode）+ app/lan
 - [ ] S9 测试与收尾：解析器单测（testdata 生成脚本）、流水线行为测试、OpenAPI（utoipa）+ 契约校验、冒烟脚本 tools/smoke.sh、全部文档交叉核对、删除 plan.md
+
+## S7 剩余（写路径，直接从 api/item.rs 续写）
+
+- update/batch_update（元数据+改名/移动真实文件，注册表自动登记，last_read_time 联动，items.updated 分块事件）
+- add/upload（path/url/file_base64 三来源、入库前置校验 ignore/extensions、already_existed/skip_existing 语义、时间戳保留）
+- delete/restore（回收站移动，trash 相关 pipeline 函数已就绪：apply_trash_move/apply_restore）
+- open/show_in_folder（admin 限定 + 系统调用 + OPEN_FAILED）
+- toc/content/resource（解析器已就绪：epub.rs 的 spine_docs/xhtml_text 可复用为归一化 HTML 生成 + 锚点注入 + 资源改写；txt/md 编码归一直出；pdf/cbz UNSUPPORTED_FORMAT）
+- refresh_metadata（force 清除 overridden_fields，重建自动封面）
 
 ## 已知简化（v1 后续打磨）
 
@@ -24,6 +33,7 @@
 
 ## 进度日志
 
+- S7（读路径）完成：过滤引擎（ids/keywords/content FTS/tags/categories+match/authors/series/publisher/language/isbn/read_status/exclude_*/star/folders+exact/without_*/ext/annotation/url/in_trash 全参数）、排序稳定性（id tiebreak）、list/skeleton/aggregate/detail/count、cover GET 四分支（自定义→缓存→即时生成→404）+PUT/DELETE（admin/可写 viewer）、file（Range+immutable）、LockView（X-Sumi-Unlock 票据、主动筛选 403、全局视图排除）。冒烟全过。
 - S6 完成：parser::text（chardetng+encoding_rs 编码归一、front matter、章节启发式、md 层级目录）、epub（zip+quick-xml：OPF/NCX/nav、calibre 系列、cover-image、spine 全文、XHTML 文本提取）、docx（core.xml、document.xml 正文+Heading 大纲+首图封面）、cbz（首图封面）、mobi（EXTH 元数据+封面 record；KF8 正文列后续）、pdf（降级占位）；cover.rs（提取链：解码→Lanczos3 缩入 1024→webp q80；排版生成：系统字体回退+自动换行，缺字体纯渐变）；流水线接线（derive_book_facts：一次打开产出元数据+封面+FTS；id 漂移迁移封面/内容/FTS；drop 清缓存）。44 单测全过，端到端冒烟（txt→title/封面尺寸/FTS 短语命中/id 一致）通过。**坑**：mobi crate 实际版本 0.8；XML 元素名带命名空间前缀需按本地名匹配；TOML 依赖块被误追加进 [profile.release] 完成（git init、cargo 骨架）
 - S1 完成：信封/错误码全集、admin+viewer 三档鉴权（含直链 ?token= 通道）、startup 网关、/health、app/info|startup|status|token（Host 环回校验 INVALID_HOST）、SSE events、config.toml 模板生成+坏文件保留上次有效配置+原子写回、TaskTracker、--dump-openapi。冒烟验证通过
 - S2/S3 完成：ItemCore 模型（paths 多位置/overridden_fields/主路径派生）、元数据 TOML 手写序列化（roundtrip 测试）、双模式 MetadataStore（metadata.db schema v1 / *.toml、探测 storage_mode 优先、迁移互转、冲突副本忽略）、注册表文件族（NameRegistry/ViewPreferences 级联/GlobalFilter 级联/Locks 含 Argon2id+解锁票据+节流计数+级联迁移）。22 单测
