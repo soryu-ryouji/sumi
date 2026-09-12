@@ -5,7 +5,7 @@
 ## 步骤
 
 - [x] S0 环境与骨架：git init、cargo 项目、依赖清单、plan.md
-- [ ] S1 HTTP 骨架：信封（success/error + 错误码）、鉴权中间件（admin token + viewer 三档 + 查询参数 token）、startup 就绪网关（503 NOT_READY）、/health、app 端点组（info/startup/status/token）、SSE events 通道
+- [x] S1 HTTP 骨架：信封（success/error + 错误码）、鉴权中间件（admin token + viewer 三档 + 查询参数 token）、startup 就绪网关（503 NOT_READY）、/health、app 端点组（info/startup/status/token）、SSE events 通道
 - [ ] S2 core 数据模型：Item（含 paths 多位置、回收站派生、用户编辑字段集合）、LibraryInfo、存储模式探测（storage_mode 标记优先）
 - [ ] S3 元数据存储：数据库模式（metadata.db，rusqlite）、配置文件模式（metadata/*.toml 原子写 + 冲突副本忽略）、注册表文件（categories/tags/view/global_filter/locks + config.toml 模板生成与监听重载）
 - [ ] S4 内存索引 + 索引流水线：Job 有界队列、单写者消费循环、watcher（notify）、扫描 runner（startup 四阶段 sync/scan/hash/apply + 运行期周期重扫）、id 漂移迁移（移动/复制/去重三分支）
@@ -18,3 +18,4 @@
 ## 进度日志
 
 - S0 完成（git init、cargo 骨架）
+- S1 完成：信封/错误码全集、admin+viewer 三档鉴权（含直链 ?token= 通道）、startup 网关、/health、app/info|startup|status|token（Host 环回校验 INVALID_HOST）、SSE events、config.toml 模板生成+坏文件保留上次有效配置+原子写回、TaskTracker、--dump-openapi。冒烟验证通过
