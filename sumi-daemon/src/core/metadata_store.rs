@@ -79,7 +79,7 @@ pub struct MetadataStore {
 impl MetadataStore {
     pub fn open(paths: LibraryPaths) -> MetadataStore {
         let mode = detect_storage_mode(&paths);
-        let mut store = MetadataStore {
+        let store = MetadataStore {
             paths,
             mode,
             db: Mutex::new(None),

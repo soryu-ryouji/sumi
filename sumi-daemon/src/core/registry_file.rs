@@ -5,7 +5,6 @@
 use crate::core::config::atomic_write;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::RwLock;
 
 // ---------- 表数组注册表（categories / tags：[[entry]] name = "..."） ----------

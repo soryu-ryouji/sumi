@@ -34,6 +34,15 @@ pub struct AppState {
     pub bus: EventBus,
     /// SSE 订阅因消费落后被断开（lagged）的累计次数（app/status 观测）
     pub sse_lagged: Arc<AtomicU64>,
+    // ---- 索引与存储（写路径经 Mutex<ItemIndex> 单写者）----
+    pub index: Arc<std::sync::Mutex<crate::core::index::ItemIndex>>,
+    pub store: Arc<crate::core::metadata_store::MetadataStore>,
+    // ---- 注册表 ----
+    pub categories: Arc<crate::core::registry_file::NameRegistry>,
+    pub tags: Arc<crate::core::registry_file::NameRegistry>,
+    pub prefs: Arc<crate::core::registry_file::ViewPreferences>,
+    pub global_filter: Arc<crate::core::registry_file::GlobalFilter>,
+    pub locks: Arc<crate::core::locks::Locks>,
 }
 
 pub type SharedState = Arc<AppState>;

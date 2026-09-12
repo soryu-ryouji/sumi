@@ -45,7 +45,7 @@ impl LibraryPaths {
     /// cache_parent：缓存父目录覆盖（--cache-parent / 测试指向临时目录）；
     /// None 时用系统缓存目录下的 sumi/cache。库缓存子目录 <库名>_<路径哈希16位> 在其下拼接
     pub fn new(root: &str, cache_parent: Option<String>) -> LibraryPaths {
-        let root = full_path(root);
+        let root = canonicalize_root(root);
         let sumi_dir = join_path(&root, SUMI_DIR_NAME);
         let metadata_dir = join_path(&sumi_dir, "metadata");
         let covers_dir = join_path(&sumi_dir, "covers");
@@ -280,6 +280,17 @@ fn normalize_separators(p: &str) -> String {
 fn is_absolute_path(p: &str) -> bool {
     let p = p.replace('\\', "/");
     p.starts_with('/') || p.chars().nth(1) == Some(':')
+}
+
+/// root 规范化：full_path 之后解析符号链接到真实路径。
+/// 文件监听（macOS FSEvents）报告的是真实路径，root 与之不一致会导致 to_relative 全部失配
+/// （经典坑：/tmp 是 /private/tmp 的符号链接）。失败时保留 full_path 结果
+fn canonicalize_root(root: &str) -> String {
+    let p = full_path(root);
+    match std::fs::canonicalize(&p) {
+        Ok(real) => real.to_string_lossy().into_owned(),
+        Err(_) => p,
+    }
 }
 
 /// 简易 GetFullPath：绝对化 + 文本化归约 . 与 .. 组件（不解析符号链接，避免 Windows \\?\ 前缀）

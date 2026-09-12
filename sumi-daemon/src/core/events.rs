@@ -32,6 +32,7 @@ pub struct Event {
 /// broadcast 容量：API 文档约定积压 1024 条即断开订阅
 pub const CHANNEL_CAPACITY: usize = 1024;
 
+#[derive(Clone)]
 pub struct EventBus {
     sender: broadcast::Sender<Event>,
 }
