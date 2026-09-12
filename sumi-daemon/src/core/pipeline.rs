@@ -227,7 +227,7 @@ fn refresh_path_record(ctx: &mut PipelineCtx, item: &ItemCore, rel: &str, size: 
 
 /// 解析派生：书目元数据回填（尊重用户编辑）+ 封面提取/生成落缓存 + 尺寸回填 + FTS 写入。
 /// v1 为同步内联（正确性优先）；worker 化（CPU/4 封顶 8）在性能打磨阶段引入
-fn derive_book_facts(ctx: &mut PipelineCtx, item: &mut ItemCore, rel: &str, abs: &str) {
+pub fn derive_book_facts(ctx: &mut PipelineCtx, item: &mut ItemCore, rel: &str, abs: &str) {
     let name = LibraryPaths::name_of(rel).to_string();
     let ext = LibraryPaths::ext_of(rel);
     let bytes = match std::fs::read(abs) {

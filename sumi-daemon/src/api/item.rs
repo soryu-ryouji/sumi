@@ -5,15 +5,16 @@
 
 use crate::api::{envelope, envelope::codes, AccessLevel, AppState, LockView, SharedState};
 use crate::core::cover;
-use crate::core::item::{ItemCore, PathRecord, ORDER_FIELDS};
+use crate::core::item::{ItemCore, PathRecord};
 use crate::core::paths::LibraryPaths;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use serde::{Deserialize, Serialize};
+use std::io::Read as _;
 use std::collections::HashSet;
-use std::sync::Mutex;
+
 use utoipa_axum::router::OpenApiRouter;
 
 pub fn routes() -> OpenApiRouter<SharedState> {
@@ -27,6 +28,11 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(utoipa_axum::routes!(cover_put))
         .routes(utoipa_axum::routes!(cover_delete))
         .routes(utoipa_axum::routes!(file))
+        .routes(utoipa_axum::routes!(update))
+        .routes(utoipa_axum::routes!(batch_update))
+        .routes(utoipa_axum::routes!(add))
+        .routes(utoipa_axum::routes!(delete))
+        .routes(utoipa_axum::routes!(restore))
 }
 
 // ---------- DTO 投影 ----------
@@ -422,7 +428,6 @@ fn query_items(
 
 /// 排序主键比较（数值主键统一 i128；文本主键小写化；progress 1 位小数 ×1000 精确编码）
 fn compare_by(order_by: &str, a: &ItemCore, b: &ItemCore) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
     match order_by {
         "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
         "author" => a
@@ -594,7 +599,7 @@ async fn aggregate(
             None => missing.push(id.clone()),
         }
     }
-    let mut sort_uniq = |set: Option<HashSet<String>>| -> Vec<String> {
+    let sort_uniq = |set: Option<HashSet<String>>| -> Vec<String> {
         let mut v: Vec<String> = set.unwrap_or_default().into_iter().collect();
         v.sort();
         v
@@ -778,6 +783,10 @@ async fn cover_delete(
     Ok(envelope::success())
 }
 
+fn io_err(e: std::io::Error) -> envelope::ApiError {
+    envelope::ApiError::internal(format!("IO 失败: {e}"))
+}
+
 fn require_writable(access: AccessLevel) -> Result<(), envelope::ApiError> {
     match access {
         AccessLevel::Admin => Ok(()),
@@ -869,3 +878,743 @@ fn parse_range(range: &str, total: u64) -> Option<(u64, u64)> {
 
 /// 共享的 Mutex guard 便利别名（写路径使用）
 pub type IndexGuard<'a> = std::sync::MutexGuard<'a, crate::core::index::ItemIndex>;
+
+// ================= 写路径 =================
+// 单写者语义：直接持有 index Mutex（与流水线/扫描互斥），fs 操作 + 索引 + 存储在锁内完成
+
+use crate::core::pipeline::{apply_restore, apply_trash_move, PipelineCtx};
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateQuery {
+    pub id: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub folder_path: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub authors: Option<Vec<String>>,
+    #[serde(default)]
+    pub publisher: Option<String>,
+    #[serde(default)]
+    pub pubdate: Option<String>,
+    #[serde(default)]
+    pub isbn: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub series: Option<String>,
+    #[serde(default)]
+    pub series_index: Option<f64>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub categories: Option<Vec<String>>,
+    #[serde(default)]
+    pub star: Option<i64>,
+    #[serde(default)]
+    pub read_status: Option<String>,
+    #[serde(default)]
+    pub progress: Option<f64>,
+    #[serde(default)]
+    pub progress_loc: Option<String>,
+    #[serde(default)]
+    pub annotation: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// 校验 read_status / star / progress 的公共入口
+fn validate_update_fields(body: &UpdateQuery) -> Result<(), envelope::ApiError> {
+    if let Some(rs) = &body.read_status {
+        if !crate::core::item::valid_read_status(rs) {
+            return Err(envelope::ApiError::invalid_param(format!("非法 read_status: {rs}")));
+        }
+    }
+    if let Some(star) = body.star {
+        if !(0..=5).contains(&star) {
+            return Err(envelope::ApiError::invalid_param(format!("评分超界: {star}")));
+        }
+    }
+    if let Some(p) = body.progress {
+        if !(0.0..=100.0).contains(&p) {
+            return Err(envelope::ApiError::invalid_param(format!("进度超界: {p}")));
+        }
+    }
+    Ok(())
+}
+
+/// `POST /api/v1/item/update`：更新元数据；name/folder_path 同步操作真实文件
+#[utoipa::path(post, path = "/api/v1/item/update", tag = "item",
+    request_body = UpdateQuery, responses((status = 200, description = "OK")))]
+async fn update(
+    State(state): State<SharedState>,
+    Extension(access): Extension<AccessLevel>,
+    Extension(lock_view): Extension<LockView>,
+    envelope::JsonBody(body): envelope::JsonBody<UpdateQuery>,
+) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
+    require_writable(access)?;
+    validate_update_fields(&body)?;
+
+    let mut index = state.index.lock().unwrap();
+    let mut item = index
+        .get(&body.id)
+        .cloned()
+        .ok_or_else(|| envelope::ApiError::item_not_found(&body.id))?;
+    if lock_view.hides_item(&item) {
+        return Err(envelope::ApiError::locked("item is locked"));
+    }
+
+    // 目标位置（同内容多路径时按 path 指定；缺省主路径）
+    let target_path = body
+        .path
+        .clone()
+        .unwrap_or_else(|| item.primary_path().to_string());
+    if !item.paths.iter().any(|p| p.path == target_path) {
+        return Err(envelope::ApiError::invalid_param(format!("path 不属于该 item: {target_path}")));
+    }
+
+    // 改名 / 移动（先做 fs 操作，失败即拒绝）
+    let mut final_path = target_path.clone();
+    let new_name = body.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let new_folder = body
+        .folder_path
+        .as_deref()
+        .map(|f| f.trim().trim_end_matches('/'));
+    if new_name.is_some() || new_folder.is_some() {
+        let dir = new_folder.unwrap_or(LibraryPaths::dir_of(&target_path));
+        if !dir.is_empty() && !LibraryPaths::is_valid_library_path(Some(dir)) {
+            return Err(envelope::ApiError::invalid_param(format!("非法 folder_path: {dir}")));
+        }
+        let ext = LibraryPaths::ext_of(&target_path);
+        let name = new_name
+            .map(|n| if ext.is_empty() { n.to_string() } else { format!("{n}.{ext}") })
+            .unwrap_or_else(|| {
+                target_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&target_path)
+                    .to_string()
+            });
+        if name.contains('/') || name.contains('\\') || name.trim().is_empty() {
+            return Err(envelope::ApiError::invalid_param(format!("非法文件名: {name}")));
+        }
+        // 入库策略校验（白名单/ignore 与 add 同口径）
+        let new_rel = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+        let config = state.config.current();
+        if config.matches_ignore(&new_rel) {
+            return Err(envelope::ApiError::invalid_param(format!("目标命中 ignore 规则: {new_rel}")));
+        }
+        let exts = config.extension_set();
+        let new_ext = LibraryPaths::ext_of(&new_rel);
+        if !exts.is_empty() && !exts.contains(&new_ext) {
+            return Err(envelope::ApiError::new(
+                codes::UNSUPPORTED_FORMAT,
+                StatusCode::BAD_REQUEST,
+                format!("扩展名不在白名单: {new_ext}"),
+            ));
+        }
+        if new_rel != target_path {
+            let (from_abs, to_abs) = match (
+                state.paths.to_absolute(&target_path),
+                state.paths.to_absolute(&new_rel),
+            ) {
+                (Some(f), Some(t)) => (f, t),
+                _ => return Err(envelope::ApiError::invalid_param("路径非法")),
+            };
+            if std::path::Path::new(&to_abs).exists() {
+                return Err(envelope::ApiError::file_exists(&new_rel));
+            }
+            if let Some(parent) = std::path::Path::new(&to_abs).parent() {
+                std::fs::create_dir_all(parent).map_err(io_err)?;
+            }
+            std::fs::rename(&from_abs, &to_abs)
+                .map_err(|e| envelope::ApiError::internal(format!("移动失败: {e}")))?;
+            final_path = new_rel;
+        }
+    }
+
+    // 元数据应用（解析字段显式设置 → 记用户编辑）
+    let now = crate::core::paths::unix_ms(std::time::SystemTime::now());
+    let mut reading_touched = false;
+    if let Some(v) = &body.title {
+        item.title = v.clone();
+        item.mark_overridden("title");
+    }
+    if let Some(v) = &body.authors {
+        item.authors = v.clone();
+        item.mark_overridden("authors");
+    }
+    if let Some(v) = &body.publisher {
+        item.publisher = v.clone();
+        item.mark_overridden("publisher");
+    }
+    if let Some(v) = &body.pubdate {
+        item.pubdate = v.clone();
+        item.mark_overridden("pubdate");
+    }
+    if let Some(v) = &body.isbn {
+        item.isbn = v.clone();
+        item.mark_overridden("isbn");
+    }
+    if let Some(v) = &body.language {
+        item.language = v.clone();
+        item.mark_overridden("language");
+    }
+    if let Some(v) = &body.series {
+        if v.is_empty() {
+            item.series = String::new();
+            item.series_index = 0.0;
+        } else {
+            item.series = v.clone();
+            item.mark_overridden("series");
+        }
+    }
+    if let Some(v) = body.series_index {
+        item.series_index = v;
+        item.mark_overridden("series_index");
+    }
+    if let Some(v) = &body.description {
+        item.description = v.clone();
+        item.mark_overridden("description");
+    }
+    if let Some(v) = &body.tags {
+        item.tags = v.clone();
+    }
+    if let Some(v) = &body.categories {
+        for c in v {
+            let _ = state.categories.insert(c);
+        }
+        item.categories = v.clone();
+    }
+    if let Some(v) = body.star {
+        item.star = v;
+    }
+    if let Some(v) = &body.read_status {
+        item.read_status = v.clone();
+        reading_touched = true;
+    }
+    if let Some(v) = body.progress {
+        item.progress = v;
+        reading_touched = true;
+    }
+    if let Some(v) = &body.progress_loc {
+        item.progress_loc = v.clone();
+        reading_touched = true;
+    }
+    if let Some(v) = &body.annotation {
+        item.annotation = v.clone();
+    }
+    if let Some(v) = &body.url {
+        item.url = v.clone();
+    }
+    if reading_touched {
+        item.last_read_time = now;
+    }
+
+    // 位置更新（改名/移动后的路径与 mtime 刷新）
+    if final_path != target_path {
+        if let Some(record) = item.paths.iter_mut().find(|p| p.path == target_path) {
+            let abs = state.paths.to_absolute(&final_path).unwrap_or_default();
+            record.path = final_path.clone();
+            record.modification_time = crate::core::paths::file_mtime_ms(&abs);
+        }
+    }
+
+    state.store.upsert(&item).map_err(envelope::ApiError::internal)?;
+    index.upsert(item.clone());
+    let dto = project_item(&state, &item);
+    drop(index);
+    state.bus.emit_json(crate::core::events::names::ITEM_UPDATED, &dto);
+    Ok(axum::Json(serde_json::json!({ "status": "success", "data": dto })))
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct BatchUpdateQuery {
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(default)]
+    add_tags: Option<Vec<String>>,
+    #[serde(default)]
+    add_categories: Option<Vec<String>>,
+    #[serde(default)]
+    star: Option<i64>,
+    #[serde(default)]
+    read_status: Option<String>,
+    #[serde(default)]
+    remove_tags: Option<Vec<String>>,
+    #[serde(default)]
+    remove_categories: Option<Vec<String>>,
+    #[serde(default)]
+    folder_path: Option<String>,
+}
+
+/// `POST /api/v1/item/batch_update`：批量更新（并集追加/移除 + 设置；部分失败语义见 API 文档）
+#[utoipa::path(post, path = "/api/v1/item/batch_update", tag = "item",
+    request_body = BatchUpdateQuery, responses((status = 200, description = "OK")))]
+async fn batch_update(
+    State(state): State<SharedState>,
+    Extension(access): Extension<AccessLevel>,
+    envelope::JsonBody(body): envelope::JsonBody<BatchUpdateQuery>,
+) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
+    require_writable(access)?;
+    let has_update = body.add_tags.is_some()
+        || body.add_categories.is_some()
+        || body.star.is_some()
+        || body.read_status.is_some()
+        || body.remove_tags.is_some()
+        || body.remove_categories.is_some()
+        || body.folder_path.is_some();
+    if !has_update {
+        return Err(envelope::ApiError::invalid_param("至少提供一个更新字段"));
+    }
+    if let Some(rs) = &body.read_status {
+        if !crate::core::item::valid_read_status(rs) {
+            return Err(envelope::ApiError::invalid_param(format!("非法 read_status: {rs}")));
+        }
+    }
+    if let Some(star) = body.star {
+        if !(0..=5).contains(&star) {
+            return Err(envelope::ApiError::invalid_param(format!("评分超界: {star}")));
+        }
+    }
+    let now = crate::core::paths::unix_ms(std::time::SystemTime::now());
+
+    let mut index = state.index.lock().unwrap();
+    let mut updated: Vec<ItemCore> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+
+    for id in &body.ids {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let Some(mut item) = index.get(id).cloned() else {
+            missing.push(id.clone());
+            continue;
+        };
+        let mut move_failed = false;
+
+        // 移动主位置（冲突跳过该项移动；元数据照常）
+        if let Some(folder) = body.folder_path.as_deref() {
+            let folder = folder.trim().trim_end_matches('/');
+            let primary = item.primary_path().to_string();
+            if !LibraryPaths::is_in_trash(&primary) {
+                let file_name = primary.rsplit('/').next().unwrap_or(&primary).to_string();
+                let new_rel = if folder.is_empty() { file_name.clone() } else { format!("{folder}/{file_name}") };
+                match (
+                    state.paths.to_absolute(&primary),
+                    state.paths.to_absolute(&new_rel),
+                ) {
+                    (Some(from), Some(to)) if from != to => {
+                        if std::path::Path::new(&to).exists() {
+                            move_failed = true;
+                        } else {
+                            if let Some(parent) = std::path::Path::new(&to).parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if std::fs::rename(&from, &to).is_ok() {
+                                if let Some(record) = item.paths.iter_mut().find(|p| p.path == primary) {
+                                    record.path = new_rel;
+                                }
+                            } else {
+                                move_failed = true;
+                            }
+                        }
+                    }
+                    _ => move_failed = true,
+                }
+            }
+        }
+
+        if let Some(adds) = &body.add_tags {
+            for t in adds {
+                if !item.tags.contains(t) {
+                    item.tags.push(t.clone());
+                }
+            }
+        }
+        if let Some(adds) = &body.add_categories {
+            for c in adds {
+                let _ = state.categories.insert(c);
+                if !item.categories.contains(c) {
+                    item.categories.push(c.clone());
+                }
+            }
+        }
+        if let Some(removes) = &body.remove_tags {
+            item.tags.retain(|t| !removes.contains(t));
+        }
+        if let Some(removes) = &body.remove_categories {
+            item.categories.retain(|c| !removes.contains(c));
+        }
+        if let Some(star) = body.star {
+            item.star = star;
+        }
+        if let Some(rs) = &body.read_status {
+            item.read_status = rs.clone();
+            item.last_read_time = now;
+        }
+
+        if state.store.upsert(&item).is_ok() {
+            index.upsert(item.clone());
+            updated.push(item);
+        }
+        if move_failed {
+            missing.push(id.clone());
+        }
+    }
+
+    let updated_dtos: Vec<ItemDto> = updated.iter().map(|i| project_item(&state, i)).collect();
+    drop(index);
+    if !updated_dtos.is_empty() {
+        state.bus.emit_json(crate::core::events::names::ITEMS_UPDATED, &updated_dtos);
+    }
+    Ok(axum::Json(serde_json::json!({
+        "status": "success",
+        "data": { "updated": updated_dtos.len(), "missing_ids": missing }
+    })))
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct AddQuery {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    file_base64: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    folder_path: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    authors: Option<Vec<String>>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    categories: Option<Vec<String>>,
+    #[serde(default)]
+    annotation: Option<String>,
+    #[serde(default)]
+    website: Option<String>,
+    #[serde(default)]
+    skip_existing: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct AddResult {
+    item: ItemDto,
+    already_existed: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    skipped: bool,
+}
+
+/// `POST /api/v1/item/add`：添加新 item（path/url/file_base64 三选一）
+#[utoipa::path(post, path = "/api/v1/item/add", tag = "item",
+    request_body = AddQuery, responses((status = 200, description = "OK")))]
+async fn add(
+    State(state): State<SharedState>,
+    Extension(access): Extension<AccessLevel>,
+    envelope::JsonBody(body): envelope::JsonBody<AddQuery>,
+) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
+    require_writable(access)?;
+    let source_count =
+        body.path.is_some() as u8 + body.url.is_some() as u8 + body.file_base64.is_some() as u8;
+    if source_count != 1 {
+        return Err(envelope::ApiError::invalid_param(
+            "path / url / file_base64 必须提供其一",
+        ));
+    }
+
+    // 内容来源 → 字节 + 原始文件名 + 时间戳保留标记
+    let (bytes, source_name, keep_times): (Vec<u8>, String, Option<(i64, i64)>) = if let Some(p) = &body.path {
+        let meta = std::fs::metadata(p)
+            .map_err(|_| envelope::ApiError::invalid_param(format!("本地文件不存在: {p}")))?;
+        if !meta.is_file() {
+            return Err(envelope::ApiError::invalid_param("path 不是文件"));
+        }
+        let bytes = std::fs::read(p).map_err(io_err)?;
+        let name = p.rsplit('/').next().unwrap_or(p).to_string();
+        let times = Some((
+            meta.modified().map(crate::core::paths::unix_ms).unwrap_or(0),
+            meta.created().map(crate::core::paths::unix_ms).unwrap_or(0),
+        ));
+        (bytes, name, times)
+    } else if let Some(u) = &body.url {
+        let response = ureq::get(u).call().map_err(|e| envelope::ApiError::invalid_param(format!("下载失败: {e}")))?;
+        let mut bytes = Vec::new();
+        response
+            .into_body()
+            .into_reader()
+            .read_to_end(&mut bytes)
+            .map_err(io_err)?;
+        let name = url_file_name(u);
+        (bytes, name, None)
+    } else {
+        let b64 = body.file_base64.as_deref().unwrap();
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .map_err(|_| envelope::ApiError::invalid_param("file_base64 解码失败"))?;
+        (bytes, String::new(), None)
+    };
+
+    let now = crate::core::paths::unix_ms(std::time::SystemTime::now());
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    // 扩展名判定：来源文件名优先；base64 来源（source_name 空）回落 body.name 的扩展名
+    let mut ext = LibraryPaths::ext_of(&source_name);
+    if ext.is_empty() {
+        if let Some(n) = body.name.as_deref() {
+            ext = LibraryPaths::ext_of(n);
+        }
+    }
+
+    // 入库策略前置校验（写盘前拒绝）
+    let config = state.config.current();
+    if config.matches_ignore(&source_name) {
+        return Err(envelope::ApiError::invalid_param(format!("命中 ignore 规则: {source_name}")));
+    }
+    if !config.extension_set().contains(&ext) {
+        return Err(envelope::ApiError::new(
+            codes::UNSUPPORTED_FORMAT,
+            StatusCode::BAD_REQUEST,
+            format!("扩展名不在白名单: {ext}"),
+        ));
+    }
+
+    // skip_existing：内容已存在（不含回收站）时不写不追加
+    {
+        let index = state.index.lock().unwrap();
+        if let Some(existing) = index.get(&hash) {
+            if body.skip_existing.unwrap_or(false) && existing.has_library_path() {
+                let dto = project_item(&state, existing);
+                return Ok(axum::Json(serde_json::json!({
+                    "status": "success",
+                    "data": AddResult { item: dto, already_existed: true, skipped: true }
+                })));
+            }
+        }
+    }
+
+    // 写盘（目标位置）
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|n| {
+            // body.name 自带扩展名时按原样；否则补来源扩展名
+            if LibraryPaths::ext_of(n).is_empty() && !ext.is_empty() {
+                format!("{n}.{ext}")
+            } else {
+                n.to_string()
+            }
+        })
+        .unwrap_or_else(|| {
+            if source_name.is_empty() {
+                format!("{hash}.{ext}")
+            } else {
+                source_name.clone()
+            }
+        });
+    let folder = body
+        .folder_path
+        .as_deref()
+        .map(|f| f.trim().trim_end_matches('/'))
+        .unwrap_or("");
+    let rel = if folder.is_empty() { name.clone() } else { format!("{folder}/{name}") };
+    let abs = state
+        .paths
+        .to_absolute(&rel)
+        .ok_or_else(|| envelope::ApiError::invalid_param(format!("非法目标路径: {rel}")))?;
+    if std::path::Path::new(&abs).exists() {
+        return Err(envelope::ApiError::file_exists(&rel));
+    }
+    if let Some(parent) = std::path::Path::new(&abs).parent() {
+        std::fs::create_dir_all(parent).map_err(io_err)?;
+    }
+    std::fs::write(&abs, &bytes).map_err(io_err)?;
+    // path 导入保留原文件时间（文件管理器观感与 mtime 排序以原文件为准）
+    if let Some((mtime, ctime)) = keep_times {
+        let _ = filetime::set_file_times(
+            &abs,
+            filetime::FileTime::from_unix_time(ctime / 1000, (ctime % 1000 * 1_000_000) as u32),
+            filetime::FileTime::from_unix_time(mtime / 1000, (mtime % 1000 * 1_000_000) as u32),
+        );
+    }
+
+    // 流水线应用（哈希已知，直接入库 + 解析派生）
+    let mtime = crate::core::paths::file_mtime_ms(&abs);
+    let mut index = state.index.lock().unwrap();
+    let already_existed = index.get(&hash).is_some();
+    let item = match index.get(&hash).cloned() {
+        Some(mut existing) => {
+            existing.paths.push(PathRecord::new(&rel, bytes.len() as u64, mtime));
+            existing
+        }
+        None => {
+            let mut item = ItemCore::new(&hash, vec![PathRecord::new(&rel, bytes.len() as u64, mtime)], now);
+            if let Some(t) = &body.title {
+                item.title = t.clone();
+                item.mark_overridden("title");
+            }
+            if let Some(a) = &body.authors {
+                item.authors = a.clone();
+                item.mark_overridden("authors");
+            }
+            if let Some(t) = &body.tags {
+                item.tags = t.clone();
+            }
+            if let Some(c) = &body.categories {
+                for cat in c {
+                    let _ = state.categories.insert(cat);
+                }
+                item.categories = c.clone();
+            }
+            if let Some(a) = &body.annotation {
+                item.annotation = a.clone();
+            }
+            if let Some(w) = &body.website {
+                item.url = w.clone();
+            }
+            // 解析派生（封面/书目元数据/全文索引；显式指定的字段已在上面记入 overridden，
+            // derive 不会覆盖）
+            {
+                let fts = state.fulltext.as_deref();
+                let mut ctx = PipelineCtx { paths: &state.paths, index: &mut index, store: &state.store, bus: &state.bus, fulltext: fts };
+                crate::core::pipeline::derive_book_facts(&mut ctx, &mut item, &rel, &abs);
+            }
+            item
+        }
+    };
+    state.store.upsert(&item).map_err(envelope::ApiError::internal)?;
+    index.upsert(item.clone());
+    let dto = project_item(&state, &item);
+    drop(index);
+    state.bus.emit_json(crate::core::events::names::ITEM_ADDED, &dto);
+    Ok(axum::Json(serde_json::json!({
+        "status": "success",
+        "data": AddResult { item: dto, already_existed, skipped: false }
+    })))
+}
+
+fn url_file_name(url: &str) -> String {
+    url.split('/')
+        .filter(|s| !s.is_empty())
+        .last()
+        .and_then(|s| s.split('?').next())
+        .map(percent_encoding::percent_decode_str)
+        .and_then(|d| d.decode_utf8().ok().map(|s| s.into_owned()))
+        .unwrap_or_else(|| url.to_string())
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+struct DeleteQuery {
+    id: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// `POST /api/v1/item/delete`：移入回收站（不带 path 为条目级：回收全部库内位置）
+#[utoipa::path(post, path = "/api/v1/item/delete", tag = "item",
+    request_body = DeleteQuery, responses((status = 200, description = "OK")))]
+async fn delete(
+    State(state): State<SharedState>,
+    Extension(access): Extension<AccessLevel>,
+    envelope::JsonBody(body): envelope::JsonBody<DeleteQuery>,
+) -> Result<impl IntoResponse, envelope::ApiError> {
+    require_writable(access)?;
+    let mut index = state.index.lock().unwrap();
+    let item = index
+        .get(&body.id)
+        .cloned()
+        .ok_or_else(|| envelope::ApiError::item_not_found(&body.id))?;
+
+    let targets: Vec<String> = match &body.path {
+        Some(p) => vec![p.clone()],
+        None => item
+            .paths
+            .iter()
+            .filter(|p| !LibraryPaths::is_in_trash(&p.path))
+            .map(|p| p.path.clone())
+            .collect(),
+    };
+    if targets.is_empty() {
+        return Err(envelope::ApiError::invalid_param("item 无库内位置"));
+    }
+
+    let fts = state.fulltext.as_deref();
+    let mut ctx = PipelineCtx { paths: &state.paths, index: &mut index, store: &state.store, bus: &state.bus, fulltext: fts };
+    for rel in targets {
+        let Some(abs) = state.paths.to_absolute(&rel) else { continue };
+        let trash_rel = LibraryPaths::library_to_trash_path(&rel);
+        let trash_abs = state.paths.to_absolute(&trash_rel).unwrap_or_default();
+        if let Some(parent) = std::path::Path::new(&trash_abs).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::rename(&abs, &trash_abs)
+            .map_err(|e| envelope::ApiError::internal(format!("移入回收站失败: {e}")))?;
+        apply_trash_move(&mut ctx, &rel, &trash_rel);
+    }
+    Ok(envelope::success())
+}
+
+/// `POST /api/v1/item/restore`：从回收站恢复（不带 path 恢复全部回收站位置）
+#[utoipa::path(post, path = "/api/v1/item/restore", tag = "item",
+    request_body = DeleteQuery, responses((status = 200, description = "OK")))]
+async fn restore(
+    State(state): State<SharedState>,
+    Extension(access): Extension<AccessLevel>,
+    envelope::JsonBody(body): envelope::JsonBody<DeleteQuery>,
+) -> Result<impl IntoResponse, envelope::ApiError> {
+    require_writable(access)?;
+    let mut index = state.index.lock().unwrap();
+    let item = index
+        .get(&body.id)
+        .cloned()
+        .ok_or_else(|| envelope::ApiError::item_not_found(&body.id))?;
+
+    let targets: Vec<String> = match &body.path {
+        Some(p) => vec![p.clone()],
+        None => item
+            .paths
+            .iter()
+            .filter(|p| LibraryPaths::is_in_trash(&p.path))
+            .map(|p| p.path.clone())
+            .collect(),
+    };
+
+    let fts = state.fulltext.as_deref();
+    let mut ctx = PipelineCtx { paths: &state.paths, index: &mut index, store: &state.store, bus: &state.bus, fulltext: fts };
+    let mut restored = 0;
+    let mut conflicts = 0;
+    for trash_rel in targets {
+        let Some(trash_abs) = state.paths.to_absolute(&trash_rel) else { continue };
+        let original = LibraryPaths::trash_to_library_path(&trash_rel).to_string();
+        let Some(dest_abs) = state.paths.to_absolute(&original) else { continue };
+        if std::path::Path::new(&dest_abs).exists() {
+            conflicts += 1;
+            continue;
+        }
+        if let Some(parent) = std::path::Path::new(&dest_abs).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::rename(&trash_abs, &dest_abs).is_ok() {
+            apply_restore(&mut ctx, &body.id, &trash_rel);
+            restored += 1;
+        }
+    }
+    if restored == 0 && conflicts > 0 {
+        return Err(envelope::ApiError::file_exists("全部位置冲突"));
+    }
+    Ok(envelope::success())
+}
