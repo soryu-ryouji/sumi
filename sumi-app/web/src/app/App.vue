@@ -19,22 +19,38 @@ import { useUi } from '@/stores/ui';
 const conn = useConnection();
 const ui = useUi();
 const serverError = ref('');
+/** server 正在启动的预期（config 有 current 书库，或重启/换库事件到达）；
+ *  判据是「有 current」而非历史条数——书库被删后主进程已清失效 current，
+ *  用历史条数会把失效库误判为 server 正在启动，卡在启动屏 */
+const startingExpected = ref(false);
 let offError: (() => void) | undefined;
+let offRestart: (() => void) | undefined;
+let offStarted: (() => void) | undefined;
 onMounted(() => {
   boot();
   offError = shell()?.onServerError((e) => {
     serverError.value = e.message;
+    startingExpected.value = false;
   });
+  offRestart = shell()?.onServerRestarting(() => {
+    startingExpected.value = true;
+  });
+  offStarted = shell()?.onServerStarted(() => {
+    startingExpected.value = false;
+  });
+  void shell()
+    ?.listLibraries()
+    .then((list) => {
+      startingExpected.value = list?.current != null;
+    });
 });
-onUnmounted(() => offError?.());
-const hasHistory = ref(false);
-void shell()
-  ?.listLibraries()
-  .then((list) => {
-    hasHistory.value = list.libraries.length > 0;
-  });
+onUnmounted(() => {
+  offError?.();
+  offRestart?.();
+  offStarted?.();
+});
 
-const screen = computed<'connect' | 'starting' | 'main'>(() => (conn.ready ? 'main' : hasHistory.value ? 'starting' : 'connect'));
+const screen = computed<'connect' | 'starting' | 'main'>(() => (conn.ready ? 'main' : startingExpected.value ? 'starting' : 'connect'));
 
 function quitApp(): void {
   void shell()?.quitApp();

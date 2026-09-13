@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createWindow, loadMainPage, showMainWindow } from './window';
 import { openLibraryAt, stopServer } from './server';
-import { readConfig } from './app-config';
+import { readConfig, writeConfig } from './app-config';
 import { registerIpc } from './ipc';
 
 // Electron 会话数据（localStorage/缓存等）走平台默认位置：appData 父目录 + 固定 sumi-app 子目录。
@@ -29,6 +29,11 @@ app.whenReady().then(async () => {
 
   const libPath = readConfig().libraryPath;
   if (!libPath || !fs.existsSync(libPath)) {
+    if (libPath) {
+      // 书库目录已被删除：清除失效的 current（历史保留，引导页可重新选择；
+      // 不清的话页面会把失效库当成「server 正在启动」卡死在启动屏）
+      writeConfig({ libraryPath: undefined });
+    }
     loadMainPage(); // 书库未配置或已失效：进应用内引导页（无连接参数）
     return;
   }
