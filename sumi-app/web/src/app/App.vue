@@ -10,8 +10,8 @@ import { shell } from './shell';
 import ConnectScreen from './screens/ConnectScreen.vue';
 import StartingScreen from './screens/StartingScreen.vue';
 import WindowControls from './chrome/WindowControls.vue';
+import ContextMenuHost from './chrome/ContextMenuHost.vue';
 import MainView from '@/views/MainView.vue';
-import ReaderView from '@/views/ReaderView.vue';
 import TrashView from '@/views/TrashView.vue';
 import SettingsView from '@/views/SettingsView.vue';
 import { useUi } from '@/stores/ui';
@@ -20,7 +20,6 @@ const conn = useConnection();
 const ui = useUi();
 const serverError = ref('');
 let offError: (() => void) | undefined;
-
 onMounted(() => {
   boot();
   offError = shell()?.onServerError((e) => {
@@ -28,8 +27,6 @@ onMounted(() => {
   });
 });
 onUnmounted(() => offError?.());
-
-const inReader = computed(() => ui.readerItemId !== null);
 const hasHistory = ref(false);
 void shell()
   ?.listLibraries()
@@ -61,12 +58,12 @@ function quitApp(): void {
       <ConnectScreen v-if="screen === 'connect'" />
       <StartingScreen v-else-if="screen === 'starting'" />
       <template v-else>
-        <ReaderView v-if="inReader" />
-        <SettingsView v-else-if="ui.view === 'settings'" />
+        <SettingsView v-if="ui.view === 'settings'" />
         <TrashView v-else-if="ui.view === 'trash'" />
         <MainView v-else />
       </template>
     </template>
+    <ContextMenuHost />
     <div class="toast-wrap">
       <div v-for="t in ui.toasts" :key="t.id" class="toast" :class="t.kind">{{ t.text }}</div>
     </div>

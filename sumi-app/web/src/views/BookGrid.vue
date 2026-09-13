@@ -2,12 +2,10 @@
 // 封面网格：skeleton 布局驱动（cover 宽高自适应占位）+ 滚动加载 + 空态/错误态。
 import { onMounted, onUnmounted, ref } from 'vue';
 import { useBooks } from '@/stores/books';
-import { useUi } from '@/stores/ui';
 import { useLibrary } from '@/stores/library';
 import BookCard from './BookCard.vue';
 
 const books = useBooks();
-const ui = useUi();
 const library = useLibrary();
 
 // 冷启动：boot 已触发首载；此处兜底（直连/SSE 恢复等场景 store 仍空时）
@@ -50,7 +48,7 @@ function errorText(e: unknown): string {
       <div class="grid-empty-sub">把书籍文件拖进窗口，或点击右上角「添加书籍」</div>
     </div>
     <div v-else class="book-grid">
-      <BookCard v-for="item in books.items" :key="item.id" :item="item" @open="ui.readerItemId = item.id" />
+      <BookCard v-for="item in books.items" :key="item.id" :item="item" />
     </div>
     <div v-if="books.loading" class="grid-loading">加载中…</div>
     <div class="grid-sentinel" />

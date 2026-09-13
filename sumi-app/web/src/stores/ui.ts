@@ -14,8 +14,8 @@ export const useUi = defineStore('ui', {
     view: 'library' as ViewName,
     /** 详情侧板选中的 item id */
     selectedId: null as string | null,
-    /** 阅读器打开的 item id（非空时覆盖主界面） */
-    readerItemId: null as string | null,
+    /** 详情侧板直接进编辑态（上下文菜单「编辑元数据」置位，Inspector 消费后复位） */
+    inspectorEdit: false,
     settingsTab: 'library' as 'library' | 'scan' | 'lan' | 'cache' | 'locks' | 'about',
     toasts: [] as Toast[],
   }),

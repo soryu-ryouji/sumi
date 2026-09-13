@@ -1,14 +1,23 @@
 <script setup lang="ts">
-// 书籍卡片：封面（懒加载）+ 书名 + 阅读状态角标 + 选中态（单击选中，双击阅读）。
+// 书籍卡片：封面（懒加载）+ 书名 + 阅读状态角标 + 选中态。
+// 双击 = 系统默认应用打开；右键 = 上下文菜单（打开/定位/复制路径/编辑元数据/移入回收站）。
 import { computed, ref } from 'vue';
-import { directUrl } from '@/shared/api/client';
+import { api, ApiError, directUrl } from '@/shared/api/client';
 import { useUi } from '@/stores/ui';
+import { useBooks } from '@/stores/books';
+import { useConnection } from '@/stores/connection';
+import { useLibrary } from '@/stores/library';
+import { shell } from '@/app/shell';
+import { openContextMenu, type CtxItem } from '@/shared/lib/context-menu';
 import type { Item } from '@/shared/api/types';
 
 const props = defineProps<{ item: Item }>();
-defineEmits<{ open: [] }>();
 
 const ui = useUi();
+const books = useBooks();
+const conn = useConnection();
+const library = useLibrary();
+
 const loaded = ref(false);
 const failed = ref(false);
 
@@ -17,10 +26,65 @@ const coverUrl = computed(() => directUrl(`/item/cover`, { id: props.item.id }))
 
 const STATUS_BADGE: Record<string, string> = { reading: '读', finished: '完', abandoned: '弃' };
 const badge = computed(() => STATUS_BADGE[props.item.read_status] ?? '');
+
+const primary = computed(() => props.item.paths[0] ?? '');
+
+/** 系统默认应用打开（item/open，admin 限定） */
+async function openExternal(): Promise<void> {
+  try {
+    await api('/item/open', { method: 'POST', body: { id: props.item.id } });
+  } catch (e) {
+    ui.toastError(e instanceof ApiError ? `打开失败：${e.message}` : e);
+  }
+}
+
+async function trash(): Promise<void> {
+  try {
+    await api('/item/delete', { method: 'POST', body: { id: props.item.id } });
+    books.dropItem(props.item.id);
+    if (ui.selectedId === props.item.id) {
+      ui.selectedId = null;
+    }
+    library.refreshAll().catch(() => {});
+  } catch (e) {
+    ui.toastError(e);
+  }
+}
+
+function copyPrimaryPath(): void {
+  if (shell()) {
+    void shell()?.copyPath(primary.value).then(() => ui.toast('路径已复制'));
+  }
+}
+
+function onContextMenu(e: MouseEvent): void {
+  ui.selectedId = props.item.id;
+  const items: CtxItem[] = [];
+  if (conn.isAdmin) {
+    items.push({ label: '打开（系统默认应用）', action: () => void openExternal() });
+  }
+  if (shell()) {
+    items.push({ label: '在文件夹中显示', action: () => void shell()?.showInFolder(primary.value) });
+    items.push({ label: '复制文件路径', action: copyPrimaryPath });
+  }
+  if (conn.writable) {
+    items.push({
+      label: '编辑元数据',
+      action: () => {
+        ui.inspectorEdit = true;
+      },
+    });
+    items.push({ separator: true });
+    items.push({ label: '移入回收站', danger: true, action: () => void trash() });
+  }
+  if (items.length) {
+    openContextMenu(items, e);
+  }
+}
 </script>
 
 <template>
-  <div class="book-card" :class="{ selected }" @click="ui.selectedId = item.id" @dblclick="$emit('open')">
+  <div class="book-card" :class="{ selected }" @click="ui.selectedId = item.id" @dblclick="conn.isAdmin && openExternal()" @contextmenu="onContextMenu">
     <div class="cover-wrap">
       <img
         v-if="!failed"

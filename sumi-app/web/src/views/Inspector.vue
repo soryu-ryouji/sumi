@@ -48,6 +48,17 @@ watch(
   },
 );
 
+// 上下文菜单「编辑元数据」：选中项已定位，直接进编辑态
+watch(
+  () => ui.inspectorEdit,
+  (v) => {
+    if (v) {
+      startEdit();
+      ui.inspectorEdit = false;
+    }
+  },
+);
+
 function startEdit(): void {
   const it = item.value;
   if (!it) {
@@ -109,34 +120,6 @@ async function save(): Promise<void> {
     ui.toastError(e);
   } finally {
     saving.value = false;
-  }
-}
-
-async function trash(): Promise<void> {
-  const it = item.value;
-  if (!it) {
-    return;
-  }
-  try {
-    await api('/item/delete', { method: 'POST', body: { id: it.id } });
-    ui.selectedId = null;
-    // SSE item.trashed 会摘除条目；主动兜底
-    books.dropItem(it.id);
-    library.refreshAll().catch(() => {});
-  } catch (e) {
-    ui.toastError(e);
-  }
-}
-
-async function openFile(): Promise<void> {
-  const it = item.value;
-  if (!it) {
-    return;
-  }
-  try {
-    await api('/item/open', { method: 'POST', body: { id: it.id } });
-  } catch (e) {
-    ui.toastError(e);
   }
 }
 
@@ -242,6 +225,10 @@ async function removeCover(): Promise<void> {
           <div class="form-row"><span class="form-label">备注</span><textarea v-model="form.annotation" rows="2" /></div>
           <div class="form-row"><span class="form-label">链接</span><input v-model="form.url" type="text" /></div>
           <div class="form-row"><span class="form-label">简介</span><textarea v-model="form.description" rows="4" /></div>
+          <div class="edit-actions">
+            <button class="btn" :disabled="saving" @click="editing = false">取消</button>
+            <button class="btn primary" :disabled="saving" @click="save">保存</button>
+          </div>
         </div>
       </template>
 
@@ -253,23 +240,6 @@ async function removeCover(): Promise<void> {
           <button class="path-btn" title="复制路径" @click="copyPath(p)">⧉</button>
         </div>
       </div>
-    </div>
-
-    <div class="inspector-actions">
-      <template v-if="conn.writable">
-        <button v-if="!editing" class="btn primary" :disabled="saving" @click="startEdit">编辑</button>
-        <template v-else>
-          <button class="btn" :disabled="saving" @click="editing = false">取消</button>
-          <button class="btn primary" :disabled="saving" @click="save">保存</button>
-        </template>
-        <button class="btn" @click="ui.readerItemId = item.id; ui.view = 'library'">阅读</button>
-        <button v-if="conn.isAdmin" class="btn" @click="openFile">系统打开</button>
-        <button class="btn danger" @click="trash">移入回收站</button>
-      </template>
-      <template v-else>
-        <button class="btn" @click="ui.readerItemId = item.id; ui.view = 'library'">阅读</button>
-      </template>
-      <button class="btn ghost" @click="ui.selectedId = null">关闭</button>
     </div>
   </aside>
 </template>
@@ -412,17 +382,5 @@ async function removeCover(): Promise<void> {
 }
 .path-btn:hover {
   background: var(--hover);
-}
-.inspector-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 12px 16px;
-  border-top: 1px solid var(--border);
-}
-.btn.ghost {
-  border-color: transparent;
-  background: transparent;
-  color: var(--muted);
 }
 </style>
