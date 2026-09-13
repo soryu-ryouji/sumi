@@ -25,6 +25,13 @@ let server: ServerHandle | null = null;
  *  渲染进程经 sumi:server-conn 主动拉取兜底 */
 let startedConn: { address: string; token: string } | null = null;
 
+/** daemon stderr 落盘（打包态；开发态直接转发终端不落盘）：每次进程启动会话清空重写，
+ *  排查「watcher 静默失效/异常退出」这类无弹窗问题时唯一的日志来源 */
+function daemonLogPath(): string {
+  return path.join(app.getPath('userData'), 'daemon.log');
+}
+let daemonLogSessionStarted = false;
+
 export function getStartedConn(): { address: string; token: string } | null {
   return startedConn;
 }
@@ -119,11 +126,27 @@ function startServer(libPath: string, address: string, token: string): ServerHan
     getMainWindow()?.webContents.send(IPC.serverError, { message });
   };
 
-  // 留 stderr 尾部用于报错；开发态同时转发到终端
+  // 留 stderr 尾部用于报错；开发态转发终端，打包态追加落盘（会话首次启动清空旧日志）
+  const logPath = daemonLogPath();
+  if (!daemonLogSessionStarted) {
+    try {
+      fs.mkdirSync(path.dirname(logPath), { recursive: true });
+      fs.writeFileSync(logPath, `sumi-daemon 日志（${new Date().toLocaleString()} 起）\n`);
+      daemonLogSessionStarted = true;
+    } catch {
+      /* 日志不可写不影响运行 */
+    }
+  }
   child.stderr?.on('data', (chunk: Buffer) => {
     stderrTail = (stderrTail + chunk.toString()).slice(-4000);
     if (isDev) {
       process.stderr.write(chunk);
+    } else {
+      try {
+        fs.appendFileSync(logPath, chunk);
+      } catch {
+        /* 忽略 */
+      }
     }
   });
   child.on('error', (error) => fail(`sumi-daemon 启动失败: ${error.message}`));
