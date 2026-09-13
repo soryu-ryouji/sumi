@@ -43,6 +43,7 @@ encoding_rs = "0.8"
 mobi = "0.8"
 fontdue = "0.9.4"
 lopdf = "0.45.0"
+jpeg2k = "0.10.1"
 
 [profile.release]
 lto = true

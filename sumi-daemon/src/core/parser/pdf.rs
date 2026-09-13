@@ -68,32 +68,78 @@ pub fn extract_pdf_first_image(bytes: &[u8]) -> Option<Vec<u8>> {
     let pages = doc.get_pages();
     let (_, first_page_id) = pages.iter().next()?;
     let page = doc.get_dictionary(*first_page_id).ok()?;
-    let resources = page.get(b"Resources").ok().and_then(|o| doc.dereference(o).ok())?;
-    let resources = resources.1.as_dict().ok()?;
+    // Resources 可继承：页无直接 Resources 时沿 Parent 链向上找
+    let mut dict = Some(page);
+    while let Some(d) = dict {
+        if let Ok(res) = d.get(b"Resources") {
+            if let Ok((_, res)) = doc.dereference(res) {
+                if let Ok(res) = res.as_dict() {
+                    // XObject 遍历（Form 嵌套下钻，深度限 3）
+                    if let Some(bytes) = xobject_first_image(&doc, res, 0) {
+                        return Some(bytes);
+                    }
+                    break;
+                }
+            }
+        }
+        dict = d.get(b"Parent").ok().and_then(|o| doc.dereference(o).ok()).and_then(|(_, o)| o.as_dict().ok());
+    }
+    // 回退：页面自带缩略图（/Thumb 是页面对象上的图像流，恰好是首页缩略）
+    if let Ok(thumb) = page.get(b"Thumb") {
+        if let Ok((_, thumb)) = doc.dereference(thumb) {
+            if let Ok(stream) = thumb.as_stream() {
+                if let Some(bytes) = image_stream_bytes(&doc, stream) {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// XObject 字典中第一个可解码图像（Form XObject 递归下钻，深度限 3 防循环引用）
+fn xobject_first_image(doc: &Document, resources: &lopdf::Dictionary, depth: usize) -> Option<Vec<u8>> {
+    if depth >= 3 {
+        return None;
+    }
     let xobjects = resources.get(b"XObject").ok().and_then(|o| doc.dereference(o).ok())?.1.as_dict().ok()?;
     for (_, obj) in xobjects.iter() {
         let Some(stream) = doc.dereference(obj).ok().and_then(|(_, o)| o.as_stream().ok()) else {
             continue;
         };
         let dict = &stream.dict;
-        if dict.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Image".as_slice()) {
-            continue;
-        }
-        if let Some(bytes) = image_stream_bytes(stream) {
-            return Some(bytes);
+        match dict.get(b"Subtype").and_then(Object::as_name).ok() {
+            Some(b"Image") => {
+                if let Some(bytes) = image_stream_bytes(doc, stream) {
+                    return Some(bytes);
+                }
+            }
+            // Form XObject：容器自带 Resources,下钻其 XObject
+            Some(b"Form") => {
+                if let Some(res) = dict
+                    .get(b"Resources")
+                    .ok()
+                    .and_then(|o| doc.dereference(o).ok())
+                    .and_then(|(_, o)| o.as_dict().ok())
+                {
+                    if let Some(bytes) = xobject_first_image(doc, res, depth + 1) {
+                        return Some(bytes);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     None
 }
 
 /// 图像流 → 可解码字节（JPEG 原样直出；FlateDecode 的 8bit RGB/灰度转 PNG；其余编码放弃）
-fn image_stream_bytes(stream: &lopdf::Stream) -> Option<Vec<u8>> {
+fn image_stream_bytes(doc: &Document, stream: &lopdf::Stream) -> Option<Vec<u8>> {
     let dict = &stream.dict;
     let filters = filter_names(dict);
     let width = dict.get(b"Width").ok()?.as_i64().ok()? as u32;
     let height = dict.get(b"Height").ok()?.as_i64().ok()? as u32;
     let bpc = dict.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()).unwrap_or(8);
-    let colorspace = dict.get(b"ColorSpace").ok().and_then(|o| o.as_name().ok()).map(String::from_utf8_lossy);
     if bpc != 8 {
         return None;
     }
@@ -101,17 +147,21 @@ fn image_stream_bytes(stream: &lopdf::Stream) -> Option<Vec<u8>> {
         // JPEG 原样：封面管线（image crate）直接解码
         return Some(stream.content.clone());
     }
+    if filters == ["JPXDecode"] {
+        // JPEG 2000：jpeg2k 解码 → RGB → PNG（扫描书/部分制作器常见）
+        return decode_jpx(&stream.content);
+    }
     if filters == ["FlateDecode"] {
         let raw = stream.decompressed_content().ok()?;
         // DecodeParms 预测器：1 = 原样；2 = TIFF 水平差分；10–15 = PNG 行滤波（行首 1 字节滤波类型）
         let (predictor, columns, colors) = decode_parms(dict);
         // Columns/Colors 缺省按页宽与色空间兜底（真实文件的通用形态）
         let columns = if columns == 0 { width as usize } else { columns };
+        let form = colorspace(doc, dict)?;
         let colors = if colors == 0 {
-            match colorspace.as_deref().as_deref() {
-                Some("DeviceRGB") => 3,
-                Some("DeviceGray") => 1,
-                _ => return None,
+            match &form {
+                ColorForm::Rgb => 3,
+                ColorForm::Gray | ColorForm::Indexed(_) => 1, // Indexed 每像素 1 字节索引
             }
         } else {
             colors
@@ -133,11 +183,20 @@ fn image_stream_bytes(stream: &lopdf::Stream) -> Option<Vec<u8>> {
             }
             _ => return None,
         };
-        let rgb: Vec<u8> = match colorspace.as_deref().as_deref() {
-            Some("DeviceRGB") if data.len() >= (width * height * 3) as usize => data,
-            Some("DeviceGray") if data.len() >= (width * height) as usize => {
+        let rgb: Vec<u8> = match &form {
+            ColorForm::Rgb if data.len() >= (width * height * 3) as usize => data,
+            ColorForm::Gray if data.len() >= (width * height) as usize => {
                 // 灰度 → RGB 扩展（统一管线入口）
                 data.into_iter().flat_map(|g| [g, g, g]).collect()
+            }
+            ColorForm::Indexed(lookup) if data.len() >= (width * height) as usize => {
+                // 调色板索引 → RGB 映射
+                data.into_iter()
+                    .flat_map(|i| {
+                        let base = (i as usize) * 3;
+                        [lookup[base], lookup[base + 1], lookup[base + 2]]
+                    })
+                    .collect()
             }
             _ => return None,
         };
@@ -149,7 +208,22 @@ fn image_stream_bytes(stream: &lopdf::Stream) -> Option<Vec<u8>> {
         return Some(png);
     }
     None
-    // CCITT/JBIG2/JPX/多段 Filter 链（扫描书常见）：无可靠纯 Rust 解码，放弃 → 上层无封面
+    // CCITT/JBIG2/多段 Filter 链（扫描书常见）：无可靠纯 Rust 解码，放弃 → 上层无封面
+}
+
+/// JPXDecode（JPEG 2000）解码：jpeg2k 解为 RGB → PNG（扫描书/部分制作器常见）
+fn decode_jpx(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = jpeg2k::Image::from_bytes(bytes).ok()?;
+    let pixels = img.get_pixels(None).ok()?;
+    let jpeg2k::ImagePixelData::Rgb8(data) = pixels.data else {
+        return None; // 灰度/RGBA/16bit 等暂不支持（封面场景 RGB 为主）
+    };
+    let buf = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(pixels.width, pixels.height, data)?;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(buf)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(png)
 }
 
 /// /Filter 的名字集合（单个 Name 或 Name 数组）
@@ -161,6 +235,48 @@ fn filter_names(dict: &lopdf::Dictionary) -> Vec<String> {
             .filter_map(|o| o.as_name().ok().map(|n| String::from_utf8_lossy(n).into_owned()))
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// 色空间形态：设备 RGB / 灰度 / Indexed（调色板 RGB）
+#[derive(Debug)]
+enum ColorForm {
+    Rgb,
+    Gray,
+    /// Indexed 调色板（索引 → RGB 查找表，255 级）
+    Indexed(Vec<u8>),
+}
+
+/// /ColorSpace 解析（支持间接引用与 Indexed 数组形态）
+fn colorspace(doc: &Document, dict: &lopdf::Dictionary) -> Option<ColorForm> {
+    let obj = dict.get(b"ColorSpace").ok()?;
+    let obj = doc.dereference(obj).ok().map(|(_, o)| o).unwrap_or(obj);
+    match obj {
+        Object::Name(n) => match n.as_slice() {
+            b"DeviceRGB" => Some(ColorForm::Rgb),
+            b"DeviceGray" => Some(ColorForm::Gray),
+            _ => None,
+        },
+        Object::Array(items) => {
+            let first = items.first()?.as_name().ok()?;
+            if first == b"Indexed" || first == b"I" {
+                // [/Indexed base hival lookup]：lookup 是字符串对象或流（RGB 查找表）
+                let lookup_obj = items.get(3)?;
+                let lookup_obj = doc.dereference(lookup_obj).ok().map(|(_, o)| o).unwrap_or(lookup_obj);
+                let bytes: Vec<u8> = match lookup_obj {
+                    Object::String(b, _) => b.clone(),
+                    Object::Stream(s) => s.decompressed_content().unwrap_or_else(|_| s.content.clone()),
+                    _ => return None,
+                };
+                if bytes.len() < 768 {
+                    return None;
+                }
+                Some(ColorForm::Indexed(bytes))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -415,4 +531,8 @@ mod tests {
         assert!(extract_pdf_first_image(pdf).is_none());
     }
 }
+
+
+
+
 
