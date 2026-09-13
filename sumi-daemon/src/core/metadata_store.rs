@@ -72,7 +72,7 @@ fn metadata_dir_entries(paths: &LibraryPaths) -> std::io::Result<Vec<(String, St
 /// 读路径为注水与迁移，无并发热点）；配置文件模式直接文件 IO
 pub struct MetadataStore {
     paths: LibraryPaths,
-    mode: StorageMode,
+    mode: std::sync::RwLock<StorageMode>,
     db: Mutex<Option<Connection>>,
 }
 
@@ -81,7 +81,7 @@ impl MetadataStore {
         let mode = detect_storage_mode(&paths);
         let store = MetadataStore {
             paths,
-            mode,
+            mode: std::sync::RwLock::new(mode),
             db: Mutex::new(None),
         };
         if mode == StorageMode::Database {
@@ -92,7 +92,7 @@ impl MetadataStore {
     }
 
     pub fn mode(&self) -> StorageMode {
-        self.mode
+        *self.mode.read().unwrap()
     }
 
     fn open_db(&self) -> Connection {
@@ -140,7 +140,7 @@ impl MetadataStore {
 
     /// 全量注水（启动/对账重建）：按当前模式读全部条目
     pub fn load_all(&self) -> Vec<ItemCore> {
-        match self.mode {
+        match self.mode() {
             StorageMode::Toml => self.load_all_toml(),
             StorageMode::Database => self.load_all_db(),
         }
@@ -270,7 +270,7 @@ impl MetadataStore {
 
     /// 写入/更新单条（原子）：先写权威层，成功即视为持久
     pub fn upsert(&self, item: &ItemCore) -> Result<(), String> {
-        match self.mode {
+        match self.mode() {
             StorageMode::Toml => {
                 let path = format!("{}/{}.toml", self.paths.metadata_dir, item.id);
                 toml_meta::write_metadata_file(&path, item)
@@ -288,7 +288,7 @@ impl MetadataStore {
 
     /// 批量写入（数据库模式单事务；配置文件模式逐文件原子写）
     pub fn upsert_batch(&self, items: &[ItemCore]) -> Result<(), String> {
-        match self.mode {
+        match self.mode() {
             StorageMode::Toml => {
                 for item in items {
                     self.upsert(item)?;
@@ -309,7 +309,7 @@ impl MetadataStore {
 
     /// 删除单条（迁移/清空回收站用）
     pub fn delete(&self, id: &str) -> Result<(), String> {
-        match self.mode {
+        match self.mode() {
             StorageMode::Toml => {
                 let path = format!("{}/{id}.toml", self.paths.metadata_dir);
                 match std::fs::remove_file(&path) {
@@ -330,25 +330,11 @@ impl MetadataStore {
         }
     }
 
-    /// 配置文件模式的 (id → 文件 mtime) 清单（对账比对依据）
-    pub fn toml_mtimes(&self) -> HashMap<String, i64> {
-        let mut out = HashMap::new();
-        if self.mode != StorageMode::Toml {
-            return out;
-        }
-        if let Ok(entries) = metadata_dir_entries(&self.paths) {
-            for (id, path) in entries {
-                let mtime = crate::core::paths::file_mtime_ms(&path);
-                out.insert(id, mtime);
-            }
-        }
-        out
-    }
-
-    /// 存储模式切换：单写者内全量互转（写新权威层 → 删旧文件 → 写标记）。
-    /// 调用方随后重启进程生效；旧文件被占用删不掉时（Windows）由下次启动清理兜底
+    /// 存储模式切换：单写者内全量互转（写新权威层 → 删旧文件 → 写标记 → 切内存态）。
+    /// 内存态切换后立即使新权威层生效（不等进程重启，消除「迁移后到重启前的写入落旧层」
+    /// 的丢失窗口）；旧文件被占用删不掉时（Windows）由下次启动清理兜底
     pub fn migrate(&self, target: StorageMode, all_items: &[ItemCore]) -> Result<(), String> {
-        if target == self.mode {
+        if target == self.mode() {
             return Ok(());
         }
         match target {
@@ -382,7 +368,19 @@ impl MetadataStore {
         }
         crate::core::config::atomic_write(&self.paths.storage_mode_file, target.as_str().as_bytes())
             .map_err(|e| format!("storage_mode 标记写入失败: {e}"))?;
+        self.activate(target);
         Ok(())
+    }
+
+    /// 迁移完成后的内存态切换：重置 db 连接并翻转 mode（写路径立即走新权威层）
+    fn activate(&self, target: StorageMode) {
+        let mut guard = self.db.lock().unwrap();
+        // 先关旧连接（Windows 上句柄不释放会占用文件）
+        *guard = None;
+        if target == StorageMode::Database {
+            *guard = Some(self.open_db());
+        }
+        *self.mode.write().unwrap() = target;
     }
 }
 
@@ -485,13 +483,20 @@ mod tests {
         assert_eq!(detect_storage_mode(&paths), StorageMode::Toml);
         assert!(!Path::new(&paths.metadata_db_file).exists());
 
+        // 内存态立即切换：不重启，后续写入直接落新层（toml 文件可见）
+        let mut edited = loaded[0].clone();
+        edited.star = 3;
+        store.upsert(&edited).unwrap();
+        let reloaded = MetadataStore::open(paths.clone()).load_all();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].star, 3);
+
         // toml 模式 roundtrip
         let store = MetadataStore::open(paths.clone());
         assert_eq!(store.mode(), StorageMode::Toml);
         let loaded = store.load_all();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].star, 5);
-        assert!(!store.toml_mtimes().is_empty());
+        assert_eq!(loaded[0].star, 3);
 
         // 迁回数据库
         store.migrate(StorageMode::Database, &loaded).unwrap();

@@ -322,6 +322,11 @@ pub fn join_path(base: &str, child: &str) -> String {
     }
 }
 
+/// 路径最后一段组件是否等于 name（按组件比较："my.sumi" 不会误命中 ".sumi"）
+pub fn last_component_is(p: &str, name: &str) -> bool {
+    p.rsplit('/').next().map(|s| s == name).unwrap_or(false)
+}
+
 /// 库外系统缓存目录父级（按平台）
 fn default_cache_parent() -> String {
     #[cfg(target_os = "windows")]
@@ -460,5 +465,13 @@ mod tests {
         assert_eq!(LibraryPaths::name_of(".hidden"), ".hidden");
         assert_eq!(LibraryPaths::dir_of("novels/科幻/三体.epub"), "novels/科幻");
         assert_eq!(LibraryPaths::dir_of("三体.epub"), "");
+    }
+
+    #[test]
+    fn last_component_matching() {
+        assert!(last_component_is("/lib/.sumi", ".sumi"));
+        assert!(!last_component_is("/lib/my.sumi", ".sumi"));
+        assert!(!last_component_is("/lib/.sumi/trash", ".sumi"));
+        assert!(last_component_is(".sumi", ".sumi"));
     }
 }

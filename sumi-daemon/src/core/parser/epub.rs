@@ -245,18 +245,31 @@ fn apply_meta(opf: &mut Opf, name: &str, content: &str) {
     }
 }
 
-/// href 相对路径拼接（相对 OPF 所在目录）
-fn join_href(opf_dir: &str, href: &str) -> String {
+/// href 相对路径拼接（相对 OPF 所在目录）+ `.`/`..` 组件文本归约
+/// （zip 内条目名是字面量，相对上行段必须折叠，否则 by_name 取不到）；
+/// 归一化 content 的资源改写也复用
+pub(crate) fn join_href(opf_dir: &str, href: &str) -> String {
     let decoded = percent_encoding::percent_decode_str(href)
         .decode_utf8_lossy()
         .into_owned();
-    if opf_dir.is_empty() {
+    let joined = if opf_dir.is_empty() {
         decoded
     } else if decoded.starts_with('/') {
         decoded.trim_start_matches('/').to_string()
     } else {
         format!("{opf_dir}/{decoded}")
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for seg in joined.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
     }
+    out.join("/")
 }
 
 /// nav（EPUB3）解析：嵌套 <nav epub:type="toc"> 的 <ol><li><a>
@@ -649,6 +662,19 @@ mod tests {
             zip.finish().unwrap();
         }
         buf.into_inner()
+    }
+
+    #[test]
+    fn join_href_normalizes_relative_segments() {
+        assert_eq!(join_href("OEBPS", "images/pic.png"), "OEBPS/images/pic.png");
+        // 子目录上行引用折叠为规范 zip 路径
+        assert_eq!(join_href("OEBPS/text", "../images/pic.png"), "OEBPS/images/pic.png");
+        assert_eq!(join_href("OEBPS", "./x/../y.xhtml"), "OEBPS/y.xhtml");
+        // 绝对路径与根目录
+        assert_eq!(join_href("OEBPS", "/abs/img.png"), "abs/img.png");
+        assert_eq!(join_href("", "ch1.xhtml"), "ch1.xhtml");
+        // 上行越界不逃出根
+        assert_eq!(join_href("OEBPS", "../../x.png"), "x.png");
     }
 
     #[test]

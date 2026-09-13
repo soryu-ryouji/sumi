@@ -207,10 +207,12 @@ async fn update(
     if std::path::Path::new(&to_abs).exists() {
         return Err(envelope::ApiError::file_exists(&new));
     }
+    // 先锁索引再 rename：fs 迁移与索引迁移在同一临界区内完成，
+    // 避免 watcher 在两者间隙把新位置重复并入 item.paths
+    let mut index = state.index.lock().unwrap();
     std::fs::rename(&from_abs, &to_abs).map_err(io_err)?;
 
     // 索引位置前缀迁移（含回收站位置的对应条目不动——回收站里是独立副本）
-    let mut index = state.index.lock().unwrap();
     let prefix = format!("{old}/");
     let mut changed: Vec<crate::core::item::ItemCore> = Vec::new();
     for item in index.iter() {
@@ -277,13 +279,14 @@ async fn delete(
         if std::path::Path::new(&trash_abs).exists() {
             return Err(envelope::ApiError::file_exists(&trash_rel));
         }
+        // 先锁索引再迁移 fs 与索引位置（与 watcher 的竞态在同一临界区内收敛）
+        let mut index = state.index.lock().unwrap();
         if let Some(parent) = std::path::Path::new(&trash_abs).parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
         std::fs::rename(&abs, &trash_abs).map_err(io_err)?;
 
         // 索引位置迁移到回收站前缀
-        let mut index = state.index.lock().unwrap();
         let prefix = format!("{rel}/");
         let mut changed = Vec::new();
         for item in index.iter() {
@@ -362,13 +365,14 @@ async fn restore(
     if std::path::Path::new(&dest_abs).exists() {
         return Err(envelope::ApiError::file_exists(original));
     }
+    // 先锁索引再迁移 fs 与索引位置（与 watcher 的竞态在同一临界区内收敛）
+    let mut index = state.index.lock().unwrap();
     if let Some(parent) = std::path::Path::new(&dest_abs).parent() {
         std::fs::create_dir_all(parent).map_err(io_err)?;
     }
     std::fs::rename(&trash_abs, &dest_abs).map_err(io_err)?;
 
     // 索引位置从回收站迁回
-    let mut index = state.index.lock().unwrap();
     let prefix = format!("{trash_rel}/");
     let mut changed = Vec::new();
     for item in index.iter() {

@@ -685,7 +685,14 @@
         ],
         "responses": {
           "200": {
-            "description": "OK"
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemDto"
+                }
+              }
+            }
           }
         }
       }
@@ -695,7 +702,7 @@
         "tags": [
           "item"
         ],
-        "summary": "`GET /api/v1/item/file?id=`：原书文件字节（支持 Range；Cache-Control immutable）",
+        "summary": "`GET /api/v1/item/file?id=`：原书文件字节（流式；支持 Range；Cache-Control immutable）",
         "operationId": "file",
         "parameters": [
           {
@@ -733,7 +740,14 @@
         },
         "responses": {
           "200": {
-            "description": "OK"
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListData"
+                }
+              }
+            }
           }
         }
       }
@@ -885,7 +899,14 @@
         },
         "responses": {
           "200": {
-            "description": "OK"
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkeletonData"
+                }
+              }
+            }
           }
         }
       }
@@ -1007,7 +1028,7 @@
         "tags": [
           "library"
         ],
-        "summary": "`POST /api/v1/library/refresh_cache`：按范围刷新派生缓存（补缺失模式）",
+        "summary": "`POST /api/v1/library/refresh_cache`：按范围刷新派生缓存（补缺失模式）。\n候选筛选与派生分离：短锁取候选快照，重活（封面/全文派生）在锁外执行，\n派生后的尺寸变更短暂回锁持久化；dispatched 为本次派发的条目数",
         "operationId": "library_refresh_cache",
         "requestBody": {
           "content": {
@@ -1941,6 +1962,145 @@
           }
         }
       },
+      "ItemDto": {
+        "type": "object",
+        "description": "Item DTO（契约与 item/list 响应一致；SSE 负载同构）",
+        "required": [
+          "id",
+          "name",
+          "ext",
+          "size",
+          "title",
+          "authors",
+          "publisher",
+          "pubdate",
+          "isbn",
+          "language",
+          "series",
+          "series_index",
+          "description",
+          "url",
+          "tags",
+          "categories",
+          "paths",
+          "folders",
+          "star",
+          "read_status",
+          "progress",
+          "progress_loc",
+          "last_read_time",
+          "annotation",
+          "added_time",
+          "modification_time",
+          "custom_cover"
+        ],
+        "properties": {
+          "added_time": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "annotation": {
+            "type": "string"
+          },
+          "authors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "categories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "custom_cover": {
+            "type": "boolean"
+          },
+          "description": {
+            "type": "string"
+          },
+          "ext": {
+            "type": "string"
+          },
+          "folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "id": {
+            "type": "string"
+          },
+          "isbn": {
+            "type": "string"
+          },
+          "language": {
+            "type": "string"
+          },
+          "last_read_time": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "modification_time": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "progress": {
+            "type": "number",
+            "format": "double"
+          },
+          "progress_loc": {
+            "type": "string"
+          },
+          "pubdate": {
+            "type": "string"
+          },
+          "publisher": {
+            "type": "string"
+          },
+          "read_status": {
+            "type": "string"
+          },
+          "series": {
+            "type": "string"
+          },
+          "series_index": {
+            "type": "number",
+            "format": "double"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "star": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
       "LanConfig": {
         "type": "object",
         "required": [
@@ -2055,6 +2215,44 @@
         "properties": {
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "ListData": {
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "total_size",
+          "offset",
+          "limit"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ItemDto"
+            }
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total_size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -2399,6 +2597,64 @@
           },
           "periodic": {
             "type": "boolean"
+          }
+        }
+      },
+      "SkeletonData": {
+        "type": "object",
+        "required": [
+          "items",
+          "total_size"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SkeletonItem"
+            }
+          },
+          "total_size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "SkeletonItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "path",
+          "width",
+          "height",
+          "star",
+          "size"
+        ],
+        "properties": {
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "star": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },

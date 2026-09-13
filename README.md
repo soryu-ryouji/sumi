@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".assets/icon.png" width="128" alt="sumi logo">
+</p>
+
 <h1 align="center">sumi</h1>
 
 <p align="center">对标 Calibre 的开源书籍/文本资源管理工具（hawk 的姊妹项目）</p>
@@ -10,7 +14,7 @@
 
 ## 当前状态
 
-**sumi-daemon v1 已实现**（REST API V1 全端点 + SSE + 索引流水线 + 格式解析 + FTS5 全文检索；`cargo test` 与 `tools/smoke.sh` 全绿）。桌面客户端待启动。
+**sumi-daemon v1 已实现**（REST API V1 全端点 + SSE + 索引流水线 + 格式解析 + FTS5 全文检索）；**sumi-app 桌面客户端 v1 已实现**（Electron 壳 + Vue 3 前端：书库网格/搜索筛选/元数据编辑/拖拽入库/内置阅读器/回收站/锁/设置）。`cargo test` 与 `tools/smoke.sh` 全绿。
 
 - [架构设计](docs/architecture.md)：进程模型、核心原则、部署形态
 - [REST API V1](docs/backend/server-rest-api-v1.md)：接口定义
@@ -20,8 +24,15 @@
 - [sumi-daemon](docs/backend/server-rust.md)：Rust 后端（实现说明与已知简化）
 
 ```bash
-cd sumi-daemon && cargo build --release
-bash tools/smoke.sh          # 端到端冒烟（18 项行为断言）
+# 一键安装（构建并安装 sumi 桌面应用到本机，需 Node.js 与 Rust 工具链）
+./tools/install.sh             # Windows: ./tools/install.ps1
+
+# 开发
+bash tools/smoke.sh            # 后端端到端冒烟（46 项行为断言）
+cd sumi-app && npm run dev     # 桌面客户端开发模式（自动拉起后端）
+
+# 图标产物改版时重新生成（真源 .assets/sumi.svg，产物已入库）
+./tools/make-icons.sh
 ```
 
 ## 核心设计（与 hawk 一致）
@@ -70,8 +81,8 @@ POST http://localhost:27381/api/v1/item/update
 
 - 1.0 版本
   - [x] 实现 sumi-daemon（REST API V1，`sumi-daemon/`）
-  - [ ] 实现 Windows, macOS, Linux 桌面客户端
-  - [ ] 实现 web 书库查看器：局域网内通过浏览器访问书库
+  - [x] 实现 Windows, macOS, Linux 桌面客户端（`sumi-app/`，Electron + Vue 3）
+  - [ ] 实现 web 书库查看器：局域网内通过浏览器访问书库（前端已按 viewer 权限自适应，daemon 监听接线待打包阶段）
 - 2.0 版本
   - [ ] 内置阅读器（pdf / txt / md / epub / mobi / azw3 / docx，API 契约见 `item/toc` / `item/content` / `item/resource`）
   - [ ] 实现 sumi remote 协议，支持广域网书库查看

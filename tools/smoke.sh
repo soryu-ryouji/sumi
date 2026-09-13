@@ -108,9 +108,31 @@ sleep 1
 api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":1' || { echo "FAIL: rescan 后计数"; exit 1; }
 echo "ok library/rescan"
 
+# 回收站回归：trashed 条目在任何 rescan 后必须存活
+# （曾因扫描器不枚举 .sumi/trash 导致条目被对账永久删除）
+post item/delete "{\"id\":\"$ID\"}" | grep -q success || { echo "FAIL: re-delete"; exit 1; }
+sleep 0.6
+post library/rescan '{}' | grep -q success || { echo "FAIL: rescan(trash)"; exit 1; }
+sleep 1
+post item/list '{"in_trash":true}' | grep -q '"total":1' || { echo "FAIL: rescan 后回收站条目应存活"; exit 1; }
+post item/restore "{\"id\":\"$ID\"}" | grep -q success || { echo "FAIL: re-restore"; exit 1; }
+api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":1' || { echo "FAIL: 二次恢复后计数"; exit 1; }
+echo "ok trash-survives-rescan"
+
+# 子树 rescan 回归：限定 path 的重扫不得影响子树外条目
+# （曾因对账以全库索引对照子树事实，子树外条目被误判消失而删除）
+mkdir -p "$LIB/subA" "$LIB/subB"
+printf 'subtree-a\n' > "$LIB/subA/a.txt"
+printf 'subtree-b\n' > "$LIB/subB/b.txt"
+sleep 2
+post library/rescan '{"path":"subA"}' | grep -q success || { echo "FAIL: subtree rescan"; exit 1; }
+sleep 1
+api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":3' || { echo "FAIL: 子树 rescan 不应影响子树外条目"; exit 1; }
+echo "ok subtree-rescan"
+
 # 存储模式切换（database → toml → database）
 post library/storage_mode '{"mode":"toml"}' | grep -q success || { echo "FAIL: 迁移 toml"; exit 1; }
-[ "$(ls "$LIB"/.sumi/metadata/*.toml 2>/dev/null | wc -l | tr -d ' ')" = "1" ] || { echo "FAIL: toml 文件"; exit 1; }
+[ "$(ls "$LIB"/.sumi/metadata/*.toml 2>/dev/null | wc -l | tr -d ' ')" = "3" ] || { echo "FAIL: toml 文件"; exit 1; }
 echo "ok storage-mode-migrate"
 
 # SSE 订阅（触发一次事件应收到帧）

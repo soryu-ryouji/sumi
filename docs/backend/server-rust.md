@@ -98,7 +98,7 @@ SUMI_TOKEN=<token> sumi-daemon --library <书库路径> --port 27381 [--web-dist
 
 - 解析派生（封面/元数据/FTS）在流水线内同步执行；worker 化（`CPU/4` 封顶 8 的 cover 队列）与 `task.progress` 的 500ms 节流推送待接入
 - pdf 解析未实现（pdfium 首页渲染/书签依赖动态库，打包阶段处理）：封面 404 占位 + toc 空数组，阅读走 `item/file` + pdf.js
-- `item/content` 的 epub/docx 归一化为段落级 HTML（锚点占位注入；资源引用逐属性改写与章节锚点精确对位待增强）；mobi 直出解包内容
+- `item/content` 的 epub 归一化为章节级 HTML（spine 逐章 `<section id data-href>`，与 toc 锚点按 href 对位，章内资源引用逐属性改写为 `item/resource` 直链）；docx 为段落级 HTML；mobi 直出解包内容
 - watcher 的 rename 事件按 remove+add 防抖处理（周期扫描兜底收敛）；From/To 精确配对待加
 - `app/lan` 的监听 supervisor（`[web]` 热重绑）待接线：配置读写契约已完整
 - `index.db` 元数据镜像（大库启动加速）未接：注水直接读权威层
@@ -109,10 +109,11 @@ SUMI_TOKEN=<token> sumi-daemon --library <书库路径> --port 27381 [--web-dist
 ```bash
 cd sumi-daemon
 cargo build --release          # 产物 target/release/sumi-daemon(.exe)
+./tools/install.sh             # 一键安装：构建并装入 ~/.local/bin（Windows 为 install.ps1）
 cargo test                     # 解析器单测（testdata/ 样例书）+ 流水线行为测试 + OpenAPI 契约校验
 ```
 
 - **testdata/**：每格式准备最小样例书（含中英文混合、多卷、无封面、损坏文件等边界样例），解析器单测逐格式覆盖
-- **tools/smoke.sh**：端到端冒烟（18 项行为断言：鉴权/入库/全文/封面/Range/用户编辑保护/分类/锁票据/回收站/文件夹/view/global_filter/rescan/存储迁移/SSE）
+- **tools/smoke.sh**：端到端冒烟（46 项行为断言：鉴权/入库/全文/封面/Range/用户编辑保护/分类/锁票据/回收站/文件夹/view/global_filter/rescan/回收站扫描存活/子树重扫/存储迁移/SSE）
 - **契约测试**：`openapi.json` 固化文件与代码生成 schema 逐字一致（改 API 后 `cargo run -- --dump-openapi > openapi.json` 重新固化）
 PDFium 为 C++ 依赖：pdfium-render 随 crate 携带各平台预编译动态库（`pdfium-build` feature），无需本地工具链；打包时随 extraResources 分发。

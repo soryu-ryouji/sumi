@@ -43,23 +43,42 @@ pub fn markdown_title(text: &str) -> Option<String> {
     None
 }
 
-/// txt 章节模式启发式（识别失败由调用方回退单节点）
+/// 按行迭代（保留 \r，行宽含换行符）：
+/// (行内容不含 \n, 行首字符偏移, 该行含换行的字符宽度)。
+/// \r 保留在行内容里参与计数——CRLF 文件的 \r 也是内容字符（锚点偏移按原始文本计）
+fn lines_with_offsets(text: &str) -> impl Iterator<Item = (&str, usize, usize)> {
+    let mut rest = text;
+    let mut offset = 0usize;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (line, next) = match rest.find('\n') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
+        };
+        let start = offset;
+        let width = line.chars().count() + 1; // +1 = \n（\r 已含在 line 内）
+        offset += width;
+        rest = next;
+        Some((line, start, width))
+    })
+}
+
+/// txt 章节模式启发式（识别失败由调用方回退单节点）；锚点为原始文本的字符偏移
 pub fn txt_toc(text: &str, max_entries: usize) -> Vec<TocEntry> {
     let mut entries = Vec::new();
-    let mut current_char = 0usize;
-    for line in text.lines() {
-        let line_len = line.chars().count();
+    for (line, start, _) in lines_with_offsets(text) {
         if is_chapter_heading(line) {
             entries.push(TocEntry {
                 title: line.trim().to_string(),
-                anchor: format!("anchor:char-{current_char}"),
+                anchor: format!("anchor:char-{start}"),
                 children: Vec::new(),
             });
             if entries.len() >= max_entries {
                 break;
             }
         }
-        current_char += line_len + 1;
     }
     entries
 }
@@ -119,21 +138,18 @@ pub fn parse_text(name: &str, ext: &str, bytes: &[u8]) -> ParsedBook {
     }
 }
 
-/// md 按 `#` 标题层级建目录（展平收集 + 索引栈建树）
+/// md 按 `#` 标题层级建目录（展平收集 + 索引栈建树）；锚点为原始文本的字符偏移
 fn md_toc(text: &str) -> Vec<TocEntry> {
     // 1. 展平收集 (level, title, anchor)
     let mut flat: Vec<(u8, TocEntry)> = Vec::new();
-    let mut current_char = 0usize;
-    for line in text.lines() {
-        let line_len = line.chars().count();
+    for (line, start, _) in lines_with_offsets(text) {
         let trimmed = line.trim_start();
         let level = trimmed.chars().take_while(|c| *c == '#').count();
         if (1..=6).contains(&level) && trimmed[level..].starts_with(' ') {
             let title = trimmed[level..].trim().to_string();
-            let anchor = format!("anchor:char-{current_char}");
+            let anchor = format!("anchor:char-{start}");
             flat.push((level as u8, TocEntry { title, anchor, children: Vec::new() }));
         }
-        current_char += line_len + 1;
     }
     // 2. 递归下降建树（flat 数组小，性能无忧）
     fn build(flat: &[(u8, TocEntry)], start: &mut usize, parent_level: u8) -> Vec<TocEntry> {
@@ -196,6 +212,27 @@ mod tests {
         assert_eq!(toc[0].title, "第一章 起点");
         assert_eq!(toc[0].anchor, "anchor:char-3"); // 「开头\n」= 3 字符
         assert_eq!(toc[1].title, "第二章 转折");
+    }
+
+    #[test]
+    fn txt_toc_anchors_crlf() {
+        // CRLF：\r 也是内容字符，锚点按原始文本字符偏移（不再漂移）
+        let text = "开头\r\n第一章 起点\r\n正文";
+        let toc = txt_toc(text, 100);
+        assert_eq!(toc.len(), 1);
+        assert_eq!(toc[0].anchor, "anchor:char-4"); // 「开头\r\n」= 4 字符
+        // 标题不含尾部 \r
+        assert_eq!(toc[0].title, "第一章 起点");
+    }
+
+    #[test]
+    fn md_toc_anchors_crlf() {
+        let md = "# 一级\r\n正文\r\n## 二级\r\n";
+        let toc = md_toc(md);
+        assert_eq!(toc.len(), 1);
+        assert_eq!(toc[0].title, "一级");
+        assert_eq!(toc[0].children[0].title, "二级");
+        assert_eq!(toc[0].children[0].anchor, "anchor:char-10"); // 4+2+4=10
     }
 
     #[test]

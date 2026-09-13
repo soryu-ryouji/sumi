@@ -1,0 +1,36 @@
+# electron-builder 配置。npm run pack 会先执行 build:server（scripts/build-server.mjs，cargo build --release）
+# 产出当前平台的 sumi-daemon 二进制（Rust）。
+appId: com.sumi.app
+productName: sumi
+# 只保留中英 Chromium 语言包（默认携带全部语言包约 49MB）
+electronLanguages:
+  - zh-CN
+  - en-US
+directories:
+  output: dist
+files:
+  - electron/out/**/*
+  - web/dist/**/*
+  # 窗口图标（512px 源图，运行时按平台重采样）
+  - build/icon.png
+extraResources:
+  # 各平台 sumi-daemon 二进制（cargo build --release，见 scripts/build-server.mjs）
+  - from: resources/sumi-daemon
+    to: sumi-daemon
+# LAN web 查看（2.0 路线图）：daemon 以物理路径托管 web/dist（asar 归档内不可读取），先解包备用
+asarUnpack:
+  - web/dist/**/*
+mac:
+  category: public.app-category.productivity
+  # dir：只构建 .app 目录，zip 由 CI 负责（与 hawk 打包口径一致）
+  target: dir
+win:
+  # 绿色软件：zip 解压即用，免安装
+  target: zip
+  artifactName: ${productName}-windows-${arch}.${ext}
+linux:
+  target: AppImage
+  artifactName: sumi-linux-x64.${ext}
+  icon: build/icon.png
+  category: Office
+  syncDesktopName: true

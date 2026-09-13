@@ -106,7 +106,6 @@ fn handle_batch(
     let snapshot = config.current();
     let exts = snapshot.extension_set();
 
-    let mut fs_changed = false;
     let mut folder_changed = false;
 
     for event in batch {
@@ -119,7 +118,9 @@ fn handle_batch(
                 continue;
             }
 
-            // .sumi 内部：注册表/配置文件重载；trash 位置变化按文件处理
+            // .sumi 内部：注册表/配置文件变更重载热生效；
+            // 回收站位置（is_internal 对 trash 前缀返回 false）按普通文件处理，
+            // 与扫描器的 trash 整体枚举口径一致（回收站位置参与索引）
             if LibraryPaths::is_internal(&rel) {
                 match rel.as_str() {
                     p if p.ends_with("config.toml") => config.reload(),
@@ -136,11 +137,6 @@ fn handle_batch(
                     }
                     _ => {}
                 }
-                if LibraryPaths::is_in_trash(&rel)
-                    && matches!(event.kind, Create(_) | Modify(_) | Remove(_))
-                {
-                    fs_changed = true;
-                }
                 continue;
             }
 
@@ -149,10 +145,13 @@ fn handle_batch(
             let _ = &rel;
             match event.kind {
                 Create(_) | Modify(_) if is_file_like => {
-                    if LibraryPaths::is_hidden(&rel)
-                        || snapshot.matches_ignore(&rel)
-                        || !exts.contains(&ext)
-                    {
+                    // 回收站位置仅白名单适用；库内位置还要求非隐藏、非 ignore（与扫描器同口径）
+                    let skip = if LibraryPaths::is_in_trash(&rel) {
+                        false
+                    } else {
+                        LibraryPaths::is_hidden(&rel) || snapshot.matches_ignore(&rel)
+                    };
+                    if skip || !exts.contains(&ext) {
                         continue;
                     }
                     if let Some(abs_ok) = paths.to_absolute(&rel) {
@@ -162,7 +161,6 @@ fn handle_batch(
                                 let mut index = index.lock().unwrap();
                                 let mut ctx = PipelineCtx { paths, index: &mut index, store, bus, fulltext };
                                 apply_file_fact(&mut ctx, &rel, meta.len(), mtime);
-                                fs_changed = true;
                             }
                         }
                     }
@@ -172,9 +170,8 @@ fn handle_batch(
                     // 文件消失直接摘位置（后续周期扫描兜底漏事件）
                     if is_file_like {
                         let mut index = index.lock().unwrap();
-                        let mut ctx = PipelineCtx { paths, index: &mut index, store, bus, fulltext: None };
+                        let mut ctx = PipelineCtx { paths, index: &mut index, store, bus, fulltext };
                         apply_path_removed(&mut ctx, &rel);
-                        fs_changed = true;
                     } else {
                         folder_changed = true;
                     }
@@ -198,5 +195,4 @@ fn handle_batch(
             serde_json::json!({ "reason": "external" }),
         );
     }
-    let _ = fs_changed;
 }

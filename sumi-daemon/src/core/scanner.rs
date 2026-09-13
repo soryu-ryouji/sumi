@@ -21,7 +21,7 @@ pub type FileFacts = HashMap<String, (u64, i64)>;
 pub fn scan_library(paths: &LibraryPaths, config: &LibraryConfigSnapshot) -> std::io::Result<FileFacts> {
     let exts = config.extension_set();
     let mut facts = FileFacts::new();
-    let mut stack = vec![paths.root.clone()];
+    let mut stack = vec![paths.root.clone(), paths.trash_dir.clone()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -34,19 +34,21 @@ pub fn scan_library(paths: &LibraryPaths, config: &LibraryConfigSnapshot) -> std
             let Ok(meta) = entry.metadata() else { continue };
             let abs = entry.path().to_string_lossy().into_owned();
             if meta.is_dir() {
-                // .sumi/ 整体跳过（回收站在其下单独枚举）
-                if abs.ends_with(crate::core::paths::SUMI_DIR_NAME) {
+                // .sumi/ 整体跳过（trash/ 已单独入栈枚举）
+                if crate::core::paths::last_component_is(&abs, crate::core::paths::SUMI_DIR_NAME) {
                     continue;
                 }
                 stack.push(abs);
             } else if meta.is_file() {
                 let Some(rel) = paths.to_relative(&abs) else { continue };
-                if LibraryPaths::is_internal(&rel) {
-                    // .sumi 内部只有 trash/ 参与索引
-                    if !LibraryPaths::is_in_trash(&rel) {
-                        continue;
-                    }
-                } else if LibraryPaths::is_hidden(&rel) || config.matches_ignore(&rel) {
+                if LibraryPaths::is_in_trash(&rel) {
+                    // 回收站保留原目录结构整体索引：仅扩展名白名单适用
+                    // （ignore/隐藏是库内组织语义，不随原路径带进回收站）
+                } else if LibraryPaths::is_internal(&rel)
+                    // .sumi 其余内部文件与 ignore/隐藏/白名单外文件不入索引
+                    || LibraryPaths::is_hidden(&rel)
+                    || config.matches_ignore(&rel)
+                {
                     continue;
                 }
                 let ext = LibraryPaths::ext_of(&rel);
@@ -58,7 +60,6 @@ pub fn scan_library(paths: &LibraryPaths, config: &LibraryConfigSnapshot) -> std
             }
         }
     }
-    // 回收站条目：保留目录结构整体枚举
     Ok(facts)
 }
 
@@ -189,4 +190,56 @@ pub fn periodic_rescan_loop(
 /// 事件名常量引用（避免循环导入）
 mod names {
     pub const FOLDER_CHANGED_EVENT: &str = crate::core::events::names::FOLDER_CHANGED;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::config::LibraryConfigSnapshot;
+
+    fn temp_library(tag: &str) -> LibraryPaths {
+        let dir = std::env::temp_dir().join(format!("sumi-scan-{tag}-{}", std::process::id()));;
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        LibraryPaths::new(dir.to_str().unwrap(), Some(dir.join("cache").to_str().unwrap().to_string()))
+    }
+
+    /// 回收站位置必须进入扫描结果（否则对账会把索引中的回收站路径判为消失而删除条目）
+    #[test]
+    fn trash_enumerated_and_dotsumi_skipped() {
+        let paths = temp_library("trash");
+        paths.ensure_layout();
+        std::fs::create_dir_all(format!("{}/novels", paths.root)).unwrap();
+        std::fs::write(format!("{}/novels/三体.txt", paths.root), "正文").unwrap();
+        std::fs::create_dir_all(format!("{}/.sumi/trash/novels", paths.root)).unwrap();
+        std::fs::write(format!("{}/.sumi/trash/novels/球状闪电.txt", paths.root), "正文").unwrap();
+        // 干扰项：目录名以 .sumi 结尾（不应被当成 .sumi 跳过）
+        std::fs::create_dir_all(format!("{}/my.sumi", paths.root)).unwrap();
+        std::fs::write(format!("{}/my.sumi/书.txt", paths.root), "正文").unwrap();
+        // 干扰项：.sumi 内部非 trash 文件（不参与索引）
+        std::fs::write(format!("{}/.sumi/config.toml", paths.root), "name = 'x'").unwrap();
+
+        let facts = scan_library(&paths, &LibraryConfigSnapshot::default()).unwrap();
+        assert!(facts.contains_key("novels/三体.txt"));
+        assert!(facts.contains_key(".sumi/trash/novels/球状闪电.txt"));
+        assert!(facts.contains_key("my.sumi/书.txt"));
+        assert!(!facts.contains_key(".sumi/config.toml"));
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    /// 回收站位置不受 ignore 规则影响（ignore 是库内组织语义）
+    #[test]
+    fn trash_not_affected_by_ignore() {
+        let paths = temp_library("ignore");
+        paths.ensure_layout();
+        std::fs::create_dir_all(format!("{}/.sumi/trash/novels", paths.root)).unwrap();
+        std::fs::write(format!("{}/.sumi/trash/novels/书.txt", paths.root), "x").unwrap();
+        let config = LibraryConfigSnapshot {
+            ignore: vec!["novels".to_string()],
+            ..Default::default()
+        };
+        let facts = scan_library(&paths, &config).unwrap();
+        assert!(facts.contains_key(".sumi/trash/novels/书.txt"));
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
 }

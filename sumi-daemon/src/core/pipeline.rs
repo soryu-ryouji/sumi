@@ -70,7 +70,7 @@ pub fn apply_file_fact(
             } else {
                 let mut item = ItemCore::new(&new_hash, vec![PathRecord::new(rel, size, mtime)], now);
                 // 解析回填：一次打开文件产出书目元数据 + 封面 + 全文（契约：扫描导入即时提取）
-                derive_book_facts(ctx, &mut item, rel, &abs);
+                derive_book_facts(ctx.paths, ctx.fulltext, &mut item, rel, &abs);
                 persist_and_upsert(ctx, item);
                 emit_item_added(ctx, &new_hash);
                 Some(new_hash)
@@ -146,8 +146,16 @@ fn migrate_id_drift(
     }
 }
 
-/// 文件消失（监听事件/对账）：位置从索引移除；无剩余位置时彻底删除条目
+/// 文件消失（监听事件/对账）：位置从索引移除；无剩余位置时彻底删除条目。
+/// 对账与监听都可能滞后于磁盘真实状态，删除前 re-stat 复核：
+/// 文件仍在（扫描后才新建/改写等竞态）则跳过，交由下一轮对账按事实刷新
 pub fn apply_path_removed(ctx: &mut PipelineCtx, rel: &str) {
+    if let Some(abs) = ctx.paths.to_absolute(rel) {
+        if std::path::Path::new(&abs).exists() {
+            tracing::debug!("路径仍存在，跳过移除 {rel}");
+            return;
+        }
+    }
     let Some(owner) = ctx.index.owner_of(rel).map(|s| s.to_string()) else {
         return;
     };
@@ -226,8 +234,15 @@ fn refresh_path_record(ctx: &mut PipelineCtx, item: &ItemCore, rel: &str, size: 
 }
 
 /// 解析派生：书目元数据回填（尊重用户编辑）+ 封面提取/生成落缓存 + 尺寸回填 + FTS 写入。
+/// 只读 ctx 的 paths/fulltext（不碰 index/store），调用方自行决定持久化时机；
 /// v1 为同步内联（正确性优先）；worker 化（CPU/4 封顶 8）在性能打磨阶段引入
-pub fn derive_book_facts(ctx: &mut PipelineCtx, item: &mut ItemCore, rel: &str, abs: &str) {
+pub fn derive_book_facts(
+    paths: &LibraryPaths,
+    fulltext: Option<&crate::core::fulltext::FulltextIndex>,
+    item: &mut ItemCore,
+    rel: &str,
+    abs: &str,
+) {
     let name = LibraryPaths::name_of(rel).to_string();
     let ext = LibraryPaths::ext_of(rel);
     let bytes = match std::fs::read(abs) {
@@ -245,7 +260,7 @@ pub fn derive_book_facts(ctx: &mut PipelineCtx, item: &mut ItemCore, rel: &str, 
     }
 
     // 封面：提取链（解码→缩放→webp）或排版生成（txt/md/docx）
-    let cover_path = crate::core::cover::cache_cover_path(&ctx.paths.cache_covers_dir, &item.id);
+    let cover_path = crate::core::cover::cache_cover_path(&paths.cache_covers_dir, &item.id);
     if !std::path::Path::new(&cover_path).exists() {
         let generated: Option<(Vec<u8>, u32, u32)> = parsed
             .cover
@@ -273,7 +288,7 @@ pub fn derive_book_facts(ctx: &mut PipelineCtx, item: &mut ItemCore, rel: &str, 
     }
 
     // 全文索引（txt/md/epub/docx）
-    if let (Some(text), Some(fts)) = (&parsed.fulltext, ctx.fulltext) {
+    if let (Some(text), Some(fts)) = (&parsed.fulltext, fulltext) {
         if let Err(e) = fts.upsert(&item.id, text) {
             tracing::warn!("全文索引写入失败 {rel}: {e}");
         }

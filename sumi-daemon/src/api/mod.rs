@@ -82,7 +82,8 @@ pub fn api_router() -> (axum::Router<SharedState>, utoipa::openapi::OpenApi) {
         .split_for_parts()
 }
 
-/// 构建路由：中间件链 CORS → Auth → ReadyGate → Endpoints
+/// 构建路由：中间件链 CORS → ReadyGate → Auth → Endpoints。
+/// ready_gate 在 auth 外层：启动期 /api/* 一律 503 NOT_READY（契约），不因缺 token 变 401
 pub fn build_router(state: SharedState) -> axum::Router {
     use axum::routing::get;
     let (api_routes, _doc) = api_router();
@@ -92,12 +93,15 @@ pub fn build_router(state: SharedState) -> axum::Router {
         .with_state(state.clone())
         // 请求体上限 512MB（item/upload 契约值）
         .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024))
-        // axum 中后注册的 layer 在外层：请求依次经过 cors → auth → ready_gate
+        // axum 中后注册的 layer 在外层：请求依次经过 cors → ready_gate → auth
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             ready_gate,
         ))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), auth))
         .layer(axum::middleware::from_fn(cors))
         // 最外层兜底：handler/中间件 panic 转 500，不拖垮进程
         .layer(tower_http::catch_panic::CatchPanicLayer::new())

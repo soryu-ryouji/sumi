@@ -505,17 +505,20 @@ fn spawn_rescan(state: SharedState, sub_path: Option<String>) {
     std::thread::spawn(move || {
         let state = &*state;
         let snapshot = state.config.current();
-        let facts = match &sub_path {
+        let (facts, scope) = match &sub_path {
             Some(p) => {
-                // 子树重扫：范围内枚举
+                // 子树重扫：范围内枚举，对账范围也限定在子树内
                 let mut facts = crate::core::scanner::FileFacts::new();
                 collect_subtree(&state, p, &mut facts);
-                facts
+                (facts, Some(p.clone()))
             }
-            None => crate::core::scanner::scan_library(&state.paths, &snapshot).unwrap_or_default(),
+            None => (
+                crate::core::scanner::scan_library(&state.paths, &snapshot).unwrap_or_default(),
+                None,
+            ),
         };
         let mut index = state.index.lock().unwrap();
-        let stats = apply_facts(&state, &facts, &mut index);
+        let stats = apply_facts(state, &facts, &mut index, scope.as_deref());
         state.tasks.finish_scan(stats);
         state
             .bus
@@ -534,7 +537,10 @@ fn collect_subtree(state: &AppState, folder: &str, out: &mut crate::core::scanne
             let Ok(meta) = entry.metadata() else { continue };
             let abs = entry.path().to_string_lossy().into_owned();
             if meta.is_dir() {
-                if abs.ends_with(".sumi") {
+                if crate::core::paths::last_component_is(
+                    &abs,
+                    crate::core::paths::SUMI_DIR_NAME,
+                ) {
                     continue;
                 }
                 stack.push(abs);
@@ -558,11 +564,13 @@ fn collect_subtree(state: &AppState, folder: &str, out: &mut crate::core::scanne
     }
 }
 
-/// 事实集合对账应用（reindex/rescan 共用）
+/// 事实集合对账应用（reindex/rescan 共用）。scope = Some(folder) 时为子树重扫：
+/// missing 检测限定在子树内（子树外路径不参与对账，不会被误判消失）
 fn apply_facts(
     state: &AppState,
     facts: &crate::core::scanner::FileFacts,
     index: &mut crate::core::index::ItemIndex,
+    scope: Option<&str>,
 ) -> crate::core::tasks::ScanStats {
     let started = std::time::Instant::now();
     let stats_start = crate::core::paths::unix_ms(std::time::SystemTime::now());
@@ -570,9 +578,20 @@ fn apply_facts(
     let mut known: HashMap<&str, &(u64, i64)> = facts.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let mut to_process = Vec::new();
     let mut missing = Vec::new();
+    let in_scope = |path: &str| -> bool {
+        match scope {
+            None => true,
+            Some(folder) => {
+                path == folder || path.starts_with(&format!("{folder}/"))
+            }
+        }
+    };
     let indexed: Vec<crate::core::item::PathRecord> =
         index.iter().flat_map(|i| i.paths.iter().cloned()).collect();
     for record in &indexed {
+        if !in_scope(&record.path) {
+            continue;
+        }
         match known.remove(record.path.as_str()) {
             Some(&(size, mtime)) => {
                 if size != record.size || mtime != record.modification_time {
@@ -655,7 +674,9 @@ struct RefreshCacheBody {
     value: Option<String>,
 }
 
-/// `POST /api/v1/library/refresh_cache`：按范围刷新派生缓存（补缺失模式）
+/// `POST /api/v1/library/refresh_cache`：按范围刷新派生缓存（补缺失模式）。
+/// 候选筛选与派生分离：短锁取候选快照，重活（封面/全文派生）在锁外执行，
+/// 派生后的尺寸变更短暂回锁持久化；dispatched 为本次派发的条目数
 #[utoipa::path(post, path = "/api/v1/library/refresh_cache", tag = "library",
     request_body = RefreshCacheBody, responses((status = 200, description = "OK")))]
 async fn library_refresh_cache(
@@ -664,13 +685,12 @@ async fn library_refresh_cache(
     envelope::JsonBody(body): envelope::JsonBody<RefreshCacheBody>,
 ) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
     require_writable(access)?;
-    let state2 = state.clone();
     let kind = body.kind.clone();
     let value = body.value.clone().unwrap_or_default();
-    // 后台执行（同步重跑缺失项；范围过滤 → derive）
-    std::thread::spawn(move || {
-        let mut index = state2.index.lock().unwrap();
-        let candidates: Vec<crate::core::item::ItemCore> = index
+    // 候选快照（短锁）：范围内、库内可见、且存在缺失项（封面或全文）
+    let candidates: Vec<crate::core::item::ItemCore> = {
+        let index = state.index.lock().unwrap();
+        index
             .iter()
             .filter(|item| match kind.as_str() {
                 "library" => true,
@@ -687,30 +707,49 @@ async fn library_refresh_cache(
                 _ => false,
             })
             .filter(|item| item.has_library_path())
+            .filter(|item| {
+                let cover_missing = !std::path::Path::new(&crate::core::cover::cache_cover_path(
+                    &state.paths.cache_covers_dir,
+                    &item.id,
+                ))
+                .exists();
+                let fts_missing = state
+                    .fulltext
+                    .as_ref()
+                    .map(|fts| !fts.contains(&item.id))
+                    .unwrap_or(false);
+                cover_missing || fts_missing
+            })
             .cloned()
-            .collect();
-        let mut dispatched = 0u64;
-        #[allow(unused_assignments)]
+            .collect()
+    };
+    let dispatched = candidates.len() as u64;
+    // 后台执行（锁外重活）
+    std::thread::spawn(move || {
         for mut item in candidates {
             let primary = item.primary_path().to_string();
-            let Some(abs) = state2.paths.to_absolute(&primary) else { continue };
-            // 封面缺失重生成
-            let cached = crate::core::cover::cache_cover_path(&state2.paths.cache_covers_dir, &item.id);
-            if !std::path::Path::new(&cached).exists() {
+            let Some(abs) = state.paths.to_absolute(&primary) else { continue };
+            let cover_missing = !std::path::Path::new(&crate::core::cover::cache_cover_path(
+                &state.paths.cache_covers_dir,
+                &item.id,
+            ))
+            .exists();
+            if cover_missing {
+                // 封面缺失：重跑解析派生（书目回填尊重 overridden，封面重建，尺寸回填）
                 crate::core::pipeline::derive_book_facts(
-                    &mut crate::core::pipeline::PipelineCtx {
-                        paths: &state2.paths,
-                        index: &mut index,
-                        store: &state2.store,
-                        bus: &state2.bus,
-                        fulltext: state2.fulltext.as_deref(),
-                    },
+                    &state.paths,
+                    state.fulltext.as_deref(),
                     &mut item,
                     &primary,
                     &abs,
                 );
-                dispatched += 1;
-            } else if let Some(fts) = state2.fulltext.as_ref() {
+                // 派生结果回写（derive 只改内存副本；条目仍在索引才回写）
+                let mut index = state.index.lock().unwrap();
+                if index.get(&item.id).is_some() && state.store.upsert(&item).is_ok() {
+                    index.upsert(item.clone());
+                }
+            } else if let Some(fts) = state.fulltext.as_ref() {
+                // 全文缺失：仅补 FTS（封面仍在，无需重跑封面链）
                 if !fts.contains(&item.id) {
                     if let Ok(bytes) = std::fs::read(&abs) {
                         let name = crate::core::paths::LibraryPaths::name_of(&primary).to_string();
@@ -720,15 +759,13 @@ async fn library_refresh_cache(
                             let _ = fts.upsert(&item.id, &text);
                         }
                     }
-                    dispatched += 1;
                 }
             }
         }
-        let _ = dispatched; // 后台异步执行，计数经 item.updated 事件可见
     });
     Ok(axum::Json(serde_json::json!({
         "status": "success",
-        "data": { "dispatched": 0, "removed": 0 }
+        "data": { "dispatched": dispatched, "removed": 0 }
     })))
 }
 

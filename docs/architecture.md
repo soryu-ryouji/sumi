@@ -113,9 +113,10 @@ Electron 退出
 ```text
 sumi/
 ├── sumi-daemon/       ← Rust 后端（桌面版与服务器版共用，见 docs/backend/server-rust.md）
-├── sumi-app/          ← 桌面应用（Electron 壳 + web 前端）
-├── tools/             ← 仓库级脚本（构建/冒烟/性能压测/文档链接检查）
+├── sumi-app/          ← 桌面应用（Electron 壳 + Vue 3 web 前端）
+├── tools/             ← 仓库级脚本（构建/安装/冒烟/图标生成）
+├── .assets/           ← 品牌资产（icon 真源 sumi.svg 与各平台产物）
 └── docs/              ← 设计文档
 ```
 
-当前仓库只含 `docs/`（API 先行阶段）；`sumi-daemon` 与 `sumi-app` 在接口契约定稿后创建。浏览器插件、sumi-remote 等生态组件随对应路线图版本引入。
+浏览器插件、sumi-remote 等生态组件随对应路线图版本引入。

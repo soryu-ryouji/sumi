@@ -45,7 +45,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
 // ---------- DTO 投影 ----------
 
 /// Item DTO（契约与 item/list 响应一致；SSE 负载同构）
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, utoipa::ToSchema)]
 pub struct ItemDto {
     pub id: String,
     pub name: String,
@@ -468,7 +468,7 @@ fn primary_size(item: &ItemCore) -> u64 {
 
 // ---------- 端点 ----------
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct ListData {
     items: Vec<ItemDto>,
     total: u64,
@@ -479,7 +479,7 @@ struct ListData {
 
 /// `POST /api/v1/item/list`：查询 item 列表（过滤条件复杂故 POST；全部 AND）
 #[utoipa::path(post, path = "/api/v1/item/list", tag = "item",
-    request_body = ListQuery, responses((status = 200, description = "OK")))]
+    request_body = ListQuery, responses((status = 200, description = "OK", body = ListData)))]
 async fn list(
     State(state): State<SharedState>,
     Extension(lock_view): Extension<LockView>,
@@ -508,7 +508,7 @@ async fn list(
     })))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct SkeletonItem {
     id: String,
     path: String,
@@ -518,7 +518,7 @@ struct SkeletonItem {
     size: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct SkeletonData {
     items: Vec<SkeletonItem>,
     total_size: u64,
@@ -526,7 +526,7 @@ struct SkeletonData {
 
 /// `POST /api/v1/item/skeleton`：全量布局骨架（与 list 同序，不分页，只返回布局所需最低字段）
 #[utoipa::path(post, path = "/api/v1/item/skeleton", tag = "item",
-    request_body = ListQuery, responses((status = 200, description = "OK")))]
+    request_body = ListQuery, responses((status = 200, description = "OK", body = SkeletonData)))]
 async fn skeleton(
     State(state): State<SharedState>,
     Extension(lock_view): Extension<LockView>,
@@ -624,7 +624,7 @@ async fn aggregate(
 
 /// `GET /api/v1/item/detail?id=`：单个 Item；不存在 ITEM_NOT_FOUND
 #[utoipa::path(get, path = "/api/v1/item/detail", tag = "item",
-    params(("id" = String, Query)), responses((status = 200, description = "OK")))]
+    params(("id" = String, Query)), responses((status = 200, description = "OK", body = ItemDto)))]
 async fn detail(
     State(state): State<SharedState>,
     Extension(lock_view): Extension<LockView>,
@@ -735,6 +735,7 @@ struct CoverPut {
 async fn cover_put(
     State(state): State<SharedState>,
     Extension(access): Extension<AccessLevel>,
+    Extension(lock_view): Extension<LockView>,
     envelope::JsonBody(body): envelope::JsonBody<CoverPut>,
 ) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
     require_writable(access)?;
@@ -749,6 +750,9 @@ async fn cover_put(
         .get(&body.id)
         .cloned()
         .ok_or_else(|| envelope::ApiError::item_not_found(&body.id))?;
+    if lock_view.hides_item(&item) {
+        return Err(envelope::ApiError::locked("item is locked"));
+    }
     let target = format!("{}/{}.webp", state.paths.covers_dir, item.id);
     crate::core::config::atomic_write(&target, &processed.0)
         .map_err(|e| envelope::ApiError::internal(format!("封面写入失败: {e}")))?;
@@ -772,9 +776,18 @@ async fn cover_put(
 async fn cover_delete(
     State(state): State<SharedState>,
     Extension(access): Extension<AccessLevel>,
+    Extension(lock_view): Extension<LockView>,
     Query(params): Query<IdQuery>,
 ) -> Result<impl IntoResponse, envelope::ApiError> {
     require_writable(access)?;
+    {
+        let index = state.index.lock().unwrap();
+        if let Some(item) = index.get(&params.id) {
+            if lock_view.hides_item(item) {
+                return Err(envelope::ApiError::locked("item is locked"));
+            }
+        }
+    }
     let target = format!("{}/{}.webp", state.paths.covers_dir, params.id);
     let existed = std::path::Path::new(&target).exists();
     if existed {
@@ -808,7 +821,7 @@ fn require_writable(access: AccessLevel) -> Result<(), envelope::ApiError> {
 
 // ---------- 原文件 ----------
 
-/// `GET /api/v1/item/file?id=`：原书文件字节（支持 Range；Cache-Control immutable）
+/// `GET /api/v1/item/file?id=`：原书文件字节（流式；支持 Range；Cache-Control immutable）
 #[utoipa::path(get, path = "/api/v1/item/file", tag = "item",
     params(("id" = String, Query)), responses((status = 200, description = "原文件字节")))]
 async fn file(
@@ -831,41 +844,84 @@ async fn file(
     let Some(abs) = state.paths.to_absolute(&primary) else {
         return (StatusCode::NOT_FOUND, "file missing").into_response();
     };
-    let Ok(bytes) = std::fs::read(&abs) else {
+    let Ok(meta) = std::fs::metadata(&abs) else {
         return (StatusCode::NOT_FOUND, "file missing").into_response();
     };
+    if !meta.is_file() {
+        return (StatusCode::NOT_FOUND, "file missing").into_response();
+    }
+    let total = meta.len();
     let content_type = mime_guess::from_path(&abs).first_or_octet_stream().to_string();
 
     // Range 请求（单段；pdf.js 流式取页与 CBZ 边下边开依赖）
     if let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        if let Some((start, end)) = parse_range(range, bytes.len() as u64) {
-            let end = end.min(bytes.len() as u64 - 1);
-            let slice = bytes[start as usize..=end as usize].to_vec();
+        if let Some((start, end)) = parse_range(range, total) {
+            let len = end - start + 1;
+            let body = file_stream(abs.clone(), start, len);
             return (
                 StatusCode::PARTIAL_CONTENT,
                 [
                     (header::CONTENT_TYPE, content_type.clone()),
+                    (header::CONTENT_LENGTH, len.to_string()),
                     (
                         header::CONTENT_RANGE,
-                        format!("bytes {start}-{end}/{}", bytes.len()),
+                        format!("bytes {start}-{end}/{total}"),
                     ),
                     (header::ACCEPT_RANGES, "bytes".to_string()),
                     (header::CACHE_CONTROL, "immutable".to_string()),
                 ],
-                slice,
+                body,
             )
                 .into_response();
         }
     }
+    let body = if total == 0 {
+        axum::body::Body::empty()
+    } else {
+        file_stream(abs, 0, total)
+    };
     (
         [
             (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_LENGTH, total.to_string()),
             (header::ACCEPT_RANGES, "bytes".to_string()),
             (header::CACHE_CONTROL, "immutable".to_string()),
         ],
-        bytes,
+        body,
     )
         .into_response()
+}
+
+/// 文件区间流式读取（256KB 分块，不整读入内存）
+fn file_stream(abs: String, start: u64, len: u64) -> axum::body::Body {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let s = async_stream::stream! {
+        let mut remaining = len;
+        let Ok(mut f) = tokio::fs::File::open(&abs).await else {
+            yield Err(std::io::Error::new(std::io::ErrorKind::NotFound, "file missing"));
+            return;
+        };
+        if f.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+            yield Err(std::io::Error::other("seek failed"));
+            return;
+        }
+        let mut buf = vec![0u8; 256 * 1024];
+        while remaining > 0 {
+            let want = buf.len().min(remaining as usize);
+            match f.read(&mut buf[..want]).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    remaining -= n as u64;
+                    yield Ok(axum::body::Bytes::copy_from_slice(&buf[..n]));
+                }
+                Err(e) => {
+                    yield Err(e);
+                    break;
+                }
+            }
+        }
+    };
+    axum::body::Body::from_stream(s)
 }
 
 fn parse_range(range: &str, total: u64) -> Option<(u64, u64)> {
@@ -1192,6 +1248,13 @@ async fn batch_update(
             return Err(envelope::ApiError::invalid_param(format!("评分超界: {star}")));
         }
     }
+    // 批量移动目标目录前置校验（非法则整体拒绝，不做部分移动）
+    if let Some(folder) = body.folder_path.as_deref() {
+        let folder = folder.trim().trim_end_matches('/');
+        if !folder.is_empty() && !LibraryPaths::is_valid_library_path(Some(folder)) {
+            return Err(envelope::ApiError::invalid_param(format!("非法 folder_path: {folder}")));
+        }
+    }
     let now = crate::core::paths::unix_ms(std::time::SystemTime::now());
 
     let mut index = state.index.lock().unwrap();
@@ -1352,7 +1415,7 @@ async fn add(
             return Err(envelope::ApiError::invalid_param("path 不是文件"));
         }
         let bytes = std::fs::read(p).map_err(io_err)?;
-        let name = p.rsplit('/').next().unwrap_or(p).to_string();
+        let name = p.rsplit(['/', '\\']).next().unwrap_or(p).to_string();
         let times = Some((
             meta.modified().map(crate::core::paths::unix_ms).unwrap_or(0),
             meta.created().map(crate::core::paths::unix_ms).unwrap_or(0),
@@ -1433,11 +1496,18 @@ async fn add(
                 source_name.clone()
             }
         });
+    // 入库位置校验：文件名不含路径分隔符；目录必须是合法库内路径（不得指向 .sumi/ 内部）
+    if name.contains('/') || name.contains('\\') || name.trim().is_empty() {
+        return Err(envelope::ApiError::invalid_param(format!("非法文件名: {name}")));
+    }
     let folder = body
         .folder_path
         .as_deref()
         .map(|f| f.trim().trim_end_matches('/'))
         .unwrap_or("");
+    if !folder.is_empty() && !LibraryPaths::is_valid_library_path(Some(folder)) {
+        return Err(envelope::ApiError::invalid_param(format!("非法 folder_path: {folder}")));
+    }
     let rel = if folder.is_empty() { name.clone() } else { format!("{folder}/{name}") };
     let abs = state
         .paths
@@ -1465,7 +1535,10 @@ async fn add(
     let already_existed = index.get(&hash).is_some();
     let item = match index.get(&hash).cloned() {
         Some(mut existing) => {
-            existing.paths.push(PathRecord::new(&rel, bytes.len() as u64, mtime));
+            // 同内容去重：位置已存在时不重复追加（watcher 与本端点的竞态下保持幂等）
+            if !existing.paths.iter().any(|p| p.path == rel) {
+                existing.paths.push(PathRecord::new(&rel, bytes.len() as u64, mtime));
+            }
             existing
         }
         None => {
@@ -1495,11 +1568,13 @@ async fn add(
             }
             // 解析派生（封面/书目元数据/全文索引；显式指定的字段已在上面记入 overridden，
             // derive 不会覆盖）
-            {
-                let fts = state.fulltext.as_deref();
-                let mut ctx = PipelineCtx { paths: &state.paths, index: &mut index, store: &state.store, bus: &state.bus, fulltext: fts };
-                crate::core::pipeline::derive_book_facts(&mut ctx, &mut item, &rel, &abs);
-            }
+            crate::core::pipeline::derive_book_facts(
+                &state.paths,
+                state.fulltext.as_deref(),
+                &mut item,
+                &rel,
+                &abs,
+            );
             item
         }
     };
@@ -1733,7 +1808,7 @@ async fn content(
             let name = LibraryPaths::name_of(&primary).to_string();
             let html = match ext.as_str() {
                 "epub" => crate::core::parser::epub::parse_epub(&name, &bytes)
-                    .map(|e| normalize_epub_html(&item.id, &e)),
+                    .and_then(|e| normalize_epub_html(&item.id, &e, &bytes)),
                 "docx" => Some(normalize_docx_html(
                     crate::core::parser::docx::parse_docx(&name, &bytes),
                 )),
@@ -1766,25 +1841,89 @@ async fn content(
     }
 }
 
-/// epub 归一化：spine XHTML 逐章拼接，章节起始注入锚点 id（sec-N），资源引用改写为直链
-fn normalize_epub_html(item_id: &str, epub: &crate::core::parser::epub::EpubBook) -> String {
+/// epub 归一化：spine 各章解包 <body> 内容，逐章包 <section id="sec-N" data-href>，
+/// 章内资源引用（src/href 相对路径）改写为 item/resource 直链；
+/// toc 锚点（anchor:href:<zip 内路径>）按 data-href 对应到章节 section。
+/// v1 注：章内容按原文内嵌（书源 HTML 本地阅读器上下文，不做白名单清洗）
+fn normalize_epub_html(item_id: &str, epub: &crate::core::parser::epub::EpubBook, bytes: &[u8]) -> Option<String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
     let mut out = String::from("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>\n");
-    // 注意：这里重新解包太重，直接基于解析时的 spine 信息二次读取（简化：仅全文 HTML，
-    // 资源改写在 img/font 属性级完成）
-    out.push_str("<!-- chapters: ");
-    out.push_str(&epub.spine_docs.len().to_string());
-    out.push_str(" -->\n");
-    for (i, _doc) in epub.spine_docs.iter().enumerate() {
-        out.push_str(&format!("<section id=\"sec-{i}\"></section>\n"));
-    }
-    out.push_str(&format!("<!-- item {} fulltext follows -->\n", item_id));
-    if let Some(text) = &epub.book.fulltext {
-        for (i, chunk) in text.split('\u{0}').enumerate() {
-            let _ = i;
-            out.push_str(&format!("<p>{}</p>\n", html_escape(chunk)));
-        }
+    for (i, href) in epub.spine_docs.iter().enumerate() {
+        let xml = {
+            let mut file = archive.by_name(href).ok()?;
+            let mut raw = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut raw).ok()?;
+            String::from_utf8_lossy(&raw).into_owned()
+        };
+        let body = extract_body_inner(&xml).unwrap_or_default();
+        let dir = match href.rfind('/') {
+            Some(k) => &href[..k],
+            None => "",
+        };
+        let rewritten = rewrite_resource_refs(body, item_id, dir);
+        out.push_str(&format!(
+            "<section id=\"sec-{i}\" data-href=\"{}\">{}</section>\n",
+            html_escape(href),
+            rewritten
+        ));
     }
     out.push_str("</body></html>");
+    Some(out)
+}
+
+/// 提取 <body>…</body> 内部内容（ASCII 大小写不敏感定位，字节索引安全：
+/// 标签名全 ASCII，多字节序列内不会出现等值 ASCII 窗口）
+fn extract_body_inner(xml: &str) -> Option<&str> {
+    let find_ci = |needle: &str| -> Option<usize> {
+        let (h, n) = (xml.as_bytes(), needle.as_bytes());
+        h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
+    };
+    let open = find_ci("<body")?;
+    // 跳过 <body …> 开始标签本体
+    let content_start = xml.as_bytes()[open..]
+        .iter()
+        .position(|&b| b == b'>')
+        .map(|k| open + k + 1)?;
+    let content_end = find_ci("</body")?;
+    if content_start <= content_end {
+        Some(&xml[content_start..content_end])
+    } else {
+        None
+    }
+}
+
+/// 章内资源引用改写：src/href 相对值 → /api/v1/item/resource 直链（绝对 URL、
+/// data:、#锚点不动）；仅匹配双引号属性（xhtml 规范产物），游标推进避免回扫
+fn rewrite_resource_refs(html: &str, item_id: &str, doc_dir: &str) -> String {
+    let mut out = String::from(html);
+    for attr in ["src", "href", "poster", "data-src"] {
+        let pattern = format!("{attr}=\"");
+        let mut search_from = 0usize;
+        while let Some(rel) = out[search_from..].find(&pattern) {
+            let value_start = search_from + rel + pattern.len();
+            let Some(vlen) = out[value_start..].find('"') else { break };
+            let value_end = value_start + vlen;
+            let value = out[value_start..value_end].to_string();
+            let rewritten = if value.starts_with("http://")
+                || value.starts_with("https://")
+                || value.starts_with("data:")
+                || value.starts_with('#')
+                || value.is_empty()
+            {
+                value
+            } else {
+                let joined = crate::core::parser::epub::join_href(doc_dir, &value);
+                let encoded = percent_encoding::utf8_percent_encode(
+                    &joined,
+                    percent_encoding::NON_ALPHANUMERIC,
+                )
+                .to_string();
+                format!("/api/v1/item/resource?id={item_id}&path={encoded}")
+            };
+            out.replace_range(value_start..value_end, &rewritten);
+            search_from = value_start + rewritten.len();
+        }
+    }
     out
 }
 
@@ -2143,31 +2282,14 @@ async fn add_from_parts(
     folder_path: String,
     skip_existing: bool,
 ) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
-    let body = AddQuery {
-        path: None,
-        url: None,
-        file_base64: Some(String::new()),
-        name: name_override.or(Some(filename)),
-        folder_path: Some(folder_path),
-        title: None,
-        authors: None,
-        tags: None,
-        categories: None,
-        annotation: None,
-        website: None,
-        skip_existing: Some(skip_existing),
-    };
-    let _ = body;
-    // 直接走 add 内部逻辑（构造 base64 会拷贝大文件，这里内联简版：把 add 的核心抽出太长，
-    // 以 add 端点等价参数调用——用 channel 不必要，直接重复最小路径）
-    let state2 = state.clone();
-    let fake = AddQueryInternal {
+    let q = AddQueryInternal {
         bytes,
-        source_name: body.name.unwrap_or_default(),
-        folder_path: body.folder_path.unwrap_or_default(),
+        // name 覆盖优先；否则用上传文件名（已在 upload 中取末段）
+        source_name: name_override.unwrap_or(filename),
+        folder_path,
         skip_existing,
     };
-    add_internal(&state2, fake).await
+    add_internal(state, q).await
 }
 
 struct AddQueryInternal {
@@ -2180,23 +2302,20 @@ struct AddQueryInternal {
 async fn add_internal(state: &SharedState, q: AddQueryInternal) -> Result<axum::Json<serde_json::Value>, envelope::ApiError> {
     let now = crate::core::paths::unix_ms(std::time::SystemTime::now());
     let hash = blake3::hash(&q.bytes).to_hex().to_string();
-    let mut ext = LibraryPaths::ext_of(&q.source_name);
+    let ext = LibraryPaths::ext_of(&q.source_name);
 
     let config = state.config.current();
     if config.matches_ignore(&q.source_name) {
         return Err(envelope::ApiError::invalid_param(format!("命中 ignore 规则: {}", q.source_name)));
     }
-    if ext.is_empty() {
-        // 无扩展名（file 字段文件名缺失）：以 hash 为名 + 默认拒绝（白名单校验兜底）
-    }
-    if !ext.is_empty() && !config.extension_set().contains(&ext) {
+    // 无扩展名（file 字段文件名缺失）时不入库（白名单校验兜底）
+    if !config.extension_set().contains(&ext) {
         return Err(envelope::ApiError::new(
             codes::UNSUPPORTED_FORMAT,
             StatusCode::BAD_REQUEST,
             format!("扩展名不在白名单: {ext}"),
         ));
     }
-    let _ = &mut ext;
 
     {
         let index = state.index.lock().unwrap();
@@ -2213,12 +2332,15 @@ async fn add_internal(state: &SharedState, q: AddQueryInternal) -> Result<axum::
         }
     }
 
-    let name = if q.source_name.is_empty() {
-        format!("{hash}.{ext}")
-    } else {
-        q.source_name.clone()
-    };
+    // 入库位置校验（与 item/add 同口径）
+    let name = q.source_name.trim().to_string();
+    if name.contains('/') || name.contains('\\') || name.is_empty() {
+        return Err(envelope::ApiError::invalid_param(format!("非法文件名: {name}")));
+    }
     let folder = q.folder_path.trim().trim_end_matches('/');
+    if !folder.is_empty() && !LibraryPaths::is_valid_library_path(Some(folder)) {
+        return Err(envelope::ApiError::invalid_param(format!("非法 folder_path: {folder}")));
+    }
     let rel = if folder.is_empty() { name.clone() } else { format!("{folder}/{name}") };
     let abs = state
         .paths
@@ -2235,21 +2357,26 @@ async fn add_internal(state: &SharedState, q: AddQueryInternal) -> Result<axum::
 
     let mut index = state.index.lock().unwrap();
     let already_existed = index.get(&hash).is_some();
-    let mut item = match index.get(&hash).cloned() {
+    let item = match index.get(&hash).cloned() {
         Some(mut existing) => {
-            existing.paths.push(PathRecord::new(&rel, q.bytes.len() as u64, mtime));
+            // 同内容去重：位置已存在时不重复追加（竞态下保持幂等）
+            if !existing.paths.iter().any(|p| p.path == rel) {
+                existing.paths.push(PathRecord::new(&rel, q.bytes.len() as u64, mtime));
+            }
             existing
         }
         None => {
             let mut item = ItemCore::new(&hash, vec![PathRecord::new(&rel, q.bytes.len() as u64, mtime)], now);
-            item.title = LibraryPaths::name_of(&rel).to_string();
-            let fts = state.fulltext.as_deref();
-            let mut ctx = PipelineCtx { paths: &state.paths, index: &mut index, store: &state.store, bus: &state.bus, fulltext: fts };
-            crate::core::pipeline::derive_book_facts(&mut ctx, &mut item, &rel, &abs);
+            crate::core::pipeline::derive_book_facts(
+                &state.paths,
+                state.fulltext.as_deref(),
+                &mut item,
+                &rel,
+                &abs,
+            );
             item
         }
     };
-    let _ = &mut item;
     state.store.upsert(&item).map_err(envelope::ApiError::internal)?;
     index.upsert(item.clone());
     let dto = project_item(state, &item);

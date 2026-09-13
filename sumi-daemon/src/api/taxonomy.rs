@@ -182,7 +182,7 @@ fn emit_items_updated(state: &crate::api::AppState, dtos: Vec<crate::api::item::
 }
 
 macro_rules! registry_endpoints {
-    ($dim:literal, $reg:ident, $list:ident, $create:ident, $update:ident, $delete:ident, $exists:expr) => {
+    ($dim:literal, $reg:ident, $list:ident, $create:ident, $update:ident, $delete:ident, $exists:expr, $missing:expr) => {
         #[utoipa::path(get, path = concat!("/api/v1/", $dim, "/list"), tag = $dim,
             responses((status = 200, description = "OK")))]
         async fn $list(State(state): State<SharedState>) -> impl IntoResponse {
@@ -217,7 +217,20 @@ macro_rules! registry_endpoints {
             envelope::JsonBody(body): envelope::JsonBody<RenameBody>,
         ) -> Result<impl IntoResponse, envelope::ApiError> {
             require_writable(access)?;
-            let (count, dtos) = rename_dimension(&state, $dim, body.name.trim(), body.new_name.trim(), Some(&state.$reg))?;
+            let old = body.name.trim();
+            let new = body.new_name.trim();
+            if old.is_empty() || new.is_empty() {
+                return Err(envelope::ApiError::invalid_param("名称为空"));
+            }
+            // 注册表维度：源不存在（注册表与 item 赋值均无此名）→ NOT_FOUND
+            {
+                let index = state.index.lock().unwrap();
+                let known = !index.ids_with_named($dim, old).is_empty() || state.$reg.contains(old);
+                if !known {
+                    return Err($missing(&body.name));
+                }
+            }
+            let (count, dtos) = rename_dimension(&state, $dim, old, new, Some(&state.$reg))?;
             emit_items_updated(&state, dtos);
             let _ = count;
             Ok(envelope::success())
@@ -239,14 +252,16 @@ macro_rules! registry_endpoints {
 
 // category / tag：注册表维度（create 存在；重命名前先校验源存在）
 fn category_exists(n: &str) -> envelope::ApiError { envelope::ApiError::category_exists(n) }
+fn category_missing(n: &str) -> envelope::ApiError { envelope::ApiError::category_not_found(n) }
 fn tag_exists(n: &str) -> envelope::ApiError {
     envelope::ApiError::new(codes::TAG_EXISTS_FALLBACK, StatusCode::CONFLICT, format!("tag already exists: {n}"))
 }
+fn tag_missing(n: &str) -> envelope::ApiError { envelope::ApiError::tag_not_found(n) }
 
 registry_endpoints!("category", categories, category_list, category_create, category_update, category_delete,
-    category_exists);
+    category_exists, category_missing);
 registry_endpoints!("tag", tags, tag_list, tag_create, tag_update, tag_delete,
-    tag_exists);
+    tag_exists, tag_missing);
 
 macro_rules! derived_endpoints {
     ($dim:literal, $list:ident, $update:ident, $delete:ident, $not_found:expr) => {

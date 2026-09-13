@@ -1,0 +1,43 @@
+{
+  "name": "sumi-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "sumi",
+  "desktopName": "sumi",
+  "author": "soryu-ryouji",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "electron/out/main.mjs",
+  "scripts": {
+    "gen:types": "node scripts/gen-types.mjs",
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "vite",
+    "build": "vue-tsc --noEmit -p web/tsconfig.json && tsc --noEmit -p electron/tsconfig.json && vite build",
+    "build:electron": "node scripts/build-electron.mjs",
+    "build:server": "node scripts/build-server.mjs",
+    "pack": "npm run build && npm run build:electron && npm run build:server && node scripts/pack.mjs",
+    "pack:dir": "npm run build && npm run build:electron && npm run build:server && node scripts/pack.mjs --dir"
+  },
+  "dependencies": {
+    "@vueuse/core": "^14.4.0",
+    "pinia": "^4.0.3",
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2",
+    "openapi-typescript": "^7.13.0",
+    "smol-toml": "^1.8.0",
+    "typescript": "^5.9.3",
+    "vite": "^8.2.2",
+    "vue-tsc": "^3.3.11"
+  },
+  "allowScripts": {
+    "electron@44.3.0": true,
+    "electron-winstaller@5.4.0": true,
+    "esbuild@0.28.2": true
+  }
+}
