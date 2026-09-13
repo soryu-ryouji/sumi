@@ -44,6 +44,7 @@ mobi = "0.8"
 fontdue = "0.9.4"
 lopdf = "0.45.0"
 jpeg2k = "0.10.1"
+fax = "0.3.0"
 
 [profile.release]
 lto = true

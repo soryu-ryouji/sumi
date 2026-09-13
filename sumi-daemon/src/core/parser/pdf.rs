@@ -140,6 +140,10 @@ fn image_stream_bytes(doc: &Document, stream: &lopdf::Stream) -> Option<Vec<u8>>
     let width = dict.get(b"Width").ok()?.as_i64().ok()? as u32;
     let height = dict.get(b"Height").ok()?.as_i64().ok()? as u32;
     let bpc = dict.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()).unwrap_or(8);
+    if filters == ["CCITTFaxDecode"] {
+        // CCITT 传真编码（扫描书，1bit 位图）：fax crate 解码 G4 → 灰度 → PNG
+        return decode_ccitt(stream);
+    }
     if bpc != 8 {
         return None;
     }
@@ -150,6 +154,17 @@ fn image_stream_bytes(doc: &Document, stream: &lopdf::Stream) -> Option<Vec<u8>>
     if filters == ["JPXDecode"] {
         // JPEG 2000：jpeg2k 解码 → RGB → PNG（扫描书/部分制作器常见）
         return decode_jpx(&stream.content);
+    }
+    // 滤镜链：尾部 DCTDecode + 前段全部 FlateDecode（zlib 压缩的 JPEG——先解压再直出）
+    if filters.last().map(String::as_str) == Some("DCTDecode")
+        && filters[..filters.len() - 1].iter().all(|f| f == "FlateDecode")
+    {
+        // 借 lopdf 的 flate 解压：合成单 FlateDecode 滤镜的流重放解压，免新增压缩依赖
+        let synthetic = lopdf::Stream::new(
+            lopdf::Dictionary::from_iter(vec![(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()))]),
+            stream.content.clone(),
+        );
+        return synthetic.decompressed_content().ok().filter(|b| b.starts_with(&[0xFF, 0xD8]));
     }
     if filters == ["FlateDecode"] {
         let raw = stream.decompressed_content().ok()?;
@@ -221,6 +236,56 @@ fn decode_jpx(bytes: &[u8]) -> Option<Vec<u8>> {
     let buf = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(pixels.width, pixels.height, data)?;
     let mut png = Vec::new();
     image::DynamicImage::ImageRgb8(buf)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(png)
+}
+
+/// CCITTFaxDecode（Group 4/3 传真，扫描书）解码：fax crate 逐行过渡 → 像素 → 灰度图 → PNG
+fn decode_ccitt(stream: &lopdf::Stream) -> Option<Vec<u8>> {
+    let dict = &stream.dict;
+    let width = dict.get(b"Width").ok()?.as_i64().ok()? as u32;
+    let height = dict.get(b"Height").ok()?.as_i64().ok()? as u32;
+    // DecodeParms：K=-1 → G4（默认）；K=0 → G3 1D/2D；BlackIs1 默认 false（0=黑，1=白）
+    let parms = dict.get(b"DecodeParms").ok().and_then(|o| o.as_dict().ok());
+    let get_i64 = |k: &[u8]| parms.and_then(|d| d.get(k).ok()).and_then(|o| o.as_i64().ok());
+    let k = get_i64(b"K").unwrap_or(-1);
+    let columns = get_i64(b"Columns").unwrap_or(width as i64).max(1) as u32;
+    let rows = get_i64(b"Rows").unwrap_or(height as i64).max(1) as u32;
+    let black_is_1 = get_i64(b"BlackIs1").unwrap_or(0) != 0;
+
+    let mut gray = vec![255u8; (columns * rows) as usize];
+    let mut line_no = 0u32;
+    let mut cur: Vec<u8> = Vec::with_capacity(columns as usize);
+    // CCITT 默认：0=黑 1=白；BlackIs1 翻转。fax pels 以白起首
+    let (black, white) = if black_is_1 { (255u8, 0u8) } else { (0u8, 255u8) };
+    let mut line_cb = |transitions: &[u32]| {
+        if line_no >= rows {
+            return;
+        }
+        cur.clear();
+        for color in fax::decoder::pels(transitions, columns) {
+            cur.push(match color {
+                fax::Color::Black => black,
+                fax::Color::White => white,
+            });
+        }
+        // 行尾截断补齐（过渡序列不足列宽时余为白）
+        cur.resize(columns as usize, white);
+        let start = (line_no * columns) as usize;
+        gray[start..start + columns as usize].copy_from_slice(&cur);
+        line_no += 1;
+    };
+    let input = stream.content.iter().copied();
+    if k <= -1 {
+        fax::decoder::decode_g4(input, columns, Some(rows), &mut line_cb)?;
+    } else {
+        // G3(K=0) 行宽自适应无法预分配，封面场景罕见，跳过
+        return None;
+    }
+    let img = image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(columns, rows, gray)?;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageLuma8(img)
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .ok()?;
     Some(png)
@@ -531,6 +596,8 @@ mod tests {
         assert!(extract_pdf_first_image(pdf).is_none());
     }
 }
+
+
 
 
 
