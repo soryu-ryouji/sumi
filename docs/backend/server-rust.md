@@ -18,7 +18,7 @@ sumi 书籍管理后端，Rust 实现（`sumi-daemon/`）。
 | 哈希 | blake3 | item id = BLAKE3 hex（存储契约） |
 | epub 解析 | zip + quick-xml，自写 OPF/NCX/nav 解析 | `epub` crate 维护停滞；OPF/NCX 结构简单，自写解析精确可控（对齐 hawk「TOML 手写序列化」的取向） |
 | mobi/azw3 解析 | `mobi` crate（PDB 头 + EXTH） | v1 只取封面（EXTH cover record）与书目元数据（EXTH）；KF8 正文提取与全文索引列后续版本 |
-| pdf | pdfium-render（PDFium 绑定） | 首页渲染做封面、书签大纲做 toc；正文阅读走 `item/file` + Range（pdf.js），不做服务端转换 |
+| pdf | lopdf（纯 Rust PDF 解析） | Info 字典元数据 + 首页首图作封面；正文阅读走 `item/file` + Range（pdf.js），不做服务端转换 |
 | docx | zip + quick-xml | core.xml（title/creator）+ document.xml（正文段落/标题样式/图片关系）；OOXML 结构简单，自写转换 |
 | txt/md 编码探测 | chardetng + encoding_rs | GBK / Big5 / Shift_JIS / UTF-16 探测归一 UTF-8（中文网文刚需），WHATWG 标准算法 |
 | cbz | zip | 枚举图片条目，首张做封面 |
@@ -97,7 +97,7 @@ SUMI_TOKEN=<token> sumi-daemon --library <书库路径> --port 27381 [--web-dist
 ## 已知简化（v1 后续打磨）
 
 - 解析派生（封面/元数据/FTS）在流水线内同步执行；worker 化（`CPU/4` 封顶 8 的 cover 队列）与 `task.progress` 的 500ms 节流推送待接入
-- pdf 首页封面与 Info 字典（Title/Author）经 pdfium 渲染（动态库可选：`SUMI_PDFIUM_PATH` 注入或系统搜索；缺失时封面回退排版生成）；书签大纲未做，阅读走 `item/file` + pdf.js
+- pdf 纯解析（lopdf）：Info 字典 Title/Author + 首页首图作封面（DCT 直出 / Flate RGB 转 PNG），无图不产封面；阅读走 `item/file` + pdf.js，不做服务端自渲染
 - `item/content` 的 epub 归一化为章节级 HTML（spine 逐章 `<section id data-href>`，与 toc 锚点按 href 对位，章内资源引用逐属性改写为 `item/resource` 直链）；docx 为段落级 HTML；mobi 直出解包内容
 - watcher 的 rename 事件按 remove+add 防抖处理（周期扫描兜底收敛）；From/To 精确配对待加
 - `app/lan` 的监听 supervisor（`[web]` 热重绑）待接线：配置读写契约已完整
@@ -116,4 +116,4 @@ cargo test                     # 解析器单测（testdata/ 样例书）+ 流�
 - **testdata/**：每格式准备最小样例书（含中英文混合、多卷、无封面、损坏文件等边界样例），解析器单测逐格式覆盖
 - **tools/smoke.sh**：端到端冒烟（48 项行为断言：鉴权/入库/全文/封面/Range/用户编辑保护/分类/锁票据/回收站/文件夹/view/global_filter/rescan/回收站扫描存活/子树重扫/存储迁移/SSE）
 - **契约测试**：`openapi.json` 固化文件与代码生成 schema 逐字一致（改 API 后 `cargo run -- --dump-openapi > openapi.json` 重新固化）
-PDFium 为 C++ 依赖：动态库取 bblanchon/pdfium-binaries 预编译产物（sumi-app `scripts/fetch-pdfium.mjs` 按平台拉取），打包时随 extraResources 分发、由 Electron 经 `SUMI_PDFIUM_PATH` 注入 daemon。
+PDF 不做服务端自渲染：封面只认首页嵌入位图（无图不生成），阅读走 `item/file` + pdf.js，全链无 C++ 依赖。

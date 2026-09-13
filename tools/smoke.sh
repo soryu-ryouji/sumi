@@ -51,14 +51,40 @@ CT=$(curl -sf -o /dev/null -w '%{content_type}' "http://127.0.0.1:$PORT/api/v1/i
 [ "$CT" = "image/webp" ] || { echo "FAIL: 封面 ($CT)"; exit 1; }
 echo "ok cover"
 
-# PDF 封面：无 pdfium 环境走排版生成链（不 404）
+# PDF 封面：只认首页嵌入位图——无图 pdf 不产封面（404），嵌图 pdf 直出 webp
 mkdir -p "$LIB/docs"
-printf '%%PDF-1.4 minimal-fake\n%%%%EOF\n' > "$LIB/docs/手册.pdf"
+python3 - "$LIB/docs" <<'PYEOF'
+import sys, base64
+out_dir = sys.argv[1]
+# 无图 pdf(手工最小页,无 XObject)
+open(f"{out_dir}/手册.pdf", "wb").write(b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n%%EOF\n")
+# 带嵌入 JPEG 的 pdf(迷你红图经 DCTDecode 直嵌)
+jpeg = base64.b64decode("""/9j/4AAQSkZJRgABAQAASABIAAD/4QBMRXhpZgAATU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAACKADAAQAAAABAAAACAAAAAD/7QA4UGhvdG9zaG9wIDMuMAA4QklNBAQAAAAAAAA4QklNBCUAAAAAABDUHYzZjwCyBOmACZjs+EJ+/8AAEQgACAAIAwEiAAIRAQMRAf/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/EAB8BAAMBAQEBAQEBAQEAAAAAAAABAgMEBQYHCAkKC//EALURAAIBAgQEAwQHBQQEAAECdwABAgMRBAUhMQYSQVEHYXETIjKBCBRCkaGxwQkjM1LwFWJy0QoWJDThJfEXGBkaJicoKSo1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoKDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uLj5OXm5+jp6vLz9PX29/j5+v/bAEMAAgICAgICAwICAwQDAwMEBQQEBAQFBwUFBQUFBwgHBwcHBwcICAgICAgICAoKCgoKCgsLCwsLDQ0NDQ0NDQ0NDf/bAEMBAgICAwMDBgMDBg0JBwkNDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDf/dAAQAAf/aAAwDAQACEQMRAD8A+Q6KKK/Cz/VQ/9k=""")
+objs = [
+    b"<< /Type /Catalog /Pages 2 0 R >>",
+    b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Resources << /XObject << /Im1 4 0 R >> >> >>",
+    b"<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length " + str(len(jpeg)).encode() + b" >>stream\n" + jpeg + b"\nendstream",
+]
+out = b"%PDF-1.4\n"; offsets = []
+for i, body in enumerate(objs, 1):
+    offsets.append(len(out))
+    out += f"{i} 0 obj".encode() + body + b"endobj\n"
+xref_pos = len(out)
+out += b"xref\n0 5\n0000000000 65535 f \n"
+for off in offsets:
+    out += f"{off:010d} 00000 n \n".encode()
+out += f"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode()
+open(f"{out_dir}/带图.pdf", "wb").write(out)
+PYEOF
 sleep 2
-PDF_ID=$(post item/list '{"ext":"pdf"}' | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print(d['items'][0]['id'] if d['items'] else '')")
-[ -n "$PDF_ID" ] || { echo "FAIL: pdf 入库"; exit 1; }
-CT=$(curl -sf -o /dev/null -w '%{content_type}' "http://127.0.0.1:$PORT/api/v1/item/cover?id=$PDF_ID&token=$TOKEN")
-[ "$CT" = "image/webp" ] || { echo "FAIL: pdf 封面 ($CT)"; exit 1; }
+NO_IMG_ID=$(post item/list '{"keywords":["手册"]}' | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print(d['items'][0]['id'] if d['items'] else '')")
+IMG_ID=$(post item/list '{"keywords":["带图"]}' | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print(d['items'][0]['id'] if d['items'] else '')")
+[ -n "$NO_IMG_ID" ] && [ -n "$IMG_ID" ] || { echo "FAIL: pdf 入库"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/item/cover?id=$NO_IMG_ID")
+[ "$CODE" = "404" ] || { echo "FAIL: 无图 pdf 封面应 404 ($CODE)"; exit 1; }
+CT=$(curl -sf -o /dev/null -w '%{content_type}' "http://127.0.0.1:$PORT/api/v1/item/cover?id=$IMG_ID&token=$TOKEN")
+[ "$CT" = "image/webp" ] || { echo "FAIL: 带图 pdf 封面 ($CT)"; exit 1; }
 echo "ok pdf-cover"
 
 # 原文件 Range
@@ -94,7 +120,7 @@ echo "ok lock/unlock-ticket/global-view"
 post item/delete "{\"id\":\"$ID\"}" | grep -q success || { echo "FAIL: delete"; exit 1; }
 post item/list '{"in_trash":true}' | grep -q '"total":1' || { echo "FAIL: 回收站视图"; exit 1; }
 post item/restore "{\"id\":\"$ID\"}" | grep -q success || { echo "FAIL: restore"; exit 1; }
-api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":2' || { echo "FAIL: 恢复后计数"; exit 1; }
+api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":3' || { echo "FAIL: 恢复后计数"; exit 1; }
 echo "ok trash-roundtrip"
 
 # 文件夹树与文件夹操作
@@ -115,7 +141,7 @@ echo "ok view/global_filter"
 api "http://127.0.0.1:$PORT/api/v1/library/info" | grep -q '"storage_mode":"database"' || { echo "FAIL: library info"; exit 1; }
 post library/rescan '{}' | grep -q success || { echo "FAIL: rescan"; exit 1; }
 sleep 1
-api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":2' || { echo "FAIL: rescan 后计数"; exit 1; }
+api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":3' || { echo "FAIL: rescan 后计数"; exit 1; }
 echo "ok library/rescan"
 
 # 回收站回归：trashed 条目在任何 rescan 后必须存活
@@ -126,7 +152,7 @@ post library/rescan '{}' | grep -q success || { echo "FAIL: rescan(trash)"; exit
 sleep 1
 post item/list '{"in_trash":true}' | grep -q '"total":1' || { echo "FAIL: rescan 后回收站条目应存活"; exit 1; }
 post item/restore "{\"id\":\"$ID\"}" | grep -q success || { echo "FAIL: re-restore"; exit 1; }
-api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":2' || { echo "FAIL: 二次恢复后计数"; exit 1; }
+api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":3' || { echo "FAIL: 二次恢复后计数"; exit 1; }
 echo "ok trash-survives-rescan"
 
 # 子树 rescan 回归：限定 path 的重扫不得影响子树外条目
@@ -137,12 +163,12 @@ printf 'subtree-b\n' > "$LIB/subB/b.txt"
 sleep 2
 post library/rescan '{"path":"subA"}' | grep -q success || { echo "FAIL: subtree rescan"; exit 1; }
 sleep 1
-api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":4' || { echo "FAIL: 子树 rescan 不应影响子树外条目"; exit 1; }
+api "http://127.0.0.1:$PORT/api/v1/item/count" | grep -q '"data":5' || { echo "FAIL: 子树 rescan 不应影响子树外条目"; exit 1; }
 echo "ok subtree-rescan"
 
 # 存储模式切换（database → toml → database）
 post library/storage_mode '{"mode":"toml"}' | grep -q success || { echo "FAIL: 迁移 toml"; exit 1; }
-[ "$(ls "$LIB"/.sumi/metadata/*.toml 2>/dev/null | wc -l | tr -d ' ')" = "4" ] || { echo "FAIL: toml 文件"; exit 1; }
+[ "$(ls "$LIB"/.sumi/metadata/*.toml 2>/dev/null | wc -l | tr -d ' ')" = "5" ] || { echo "FAIL: toml 文件"; exit 1; }
 echo "ok storage-mode-migrate"
 
 # SSE 订阅（触发一次事件应收到帧）

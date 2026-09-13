@@ -41,8 +41,8 @@ quick-xml = "0.37"
 chardetng = "0.1"
 encoding_rs = "0.8"
 mobi = "0.8"
-pdfium-render = { version = "0.9.4", features = ["thread_safe"] }
 fontdue = "0.9.4"
+lopdf = "0.45.0"
 
 [profile.release]
 lto = true
