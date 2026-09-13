@@ -2040,7 +2040,10 @@ async fn open(
     if !std::path::Path::new(&abs).exists() {
         return Err(envelope::ApiError::new(codes::ITEM_NOT_FOUND, StatusCode::NOT_FOUND, "文件在磁盘上缺失"));
     }
-    let status = open_with_system(&abs);
+    // 打开方式：.sumi/config.toml 的 [openers] 按扩展名指定应用；未配置走系统默认
+    let ext = LibraryPaths::ext_of(&target);
+    let opener = state.config.current().openers.get(&ext).cloned();
+    let status = open_with_system(&abs, opener.as_deref());
     match status {
         Ok(()) => Ok(envelope::success()),
         Err(e) => Err(envelope::ApiError::open_failed(e)),
@@ -2093,7 +2096,40 @@ fn require_admin(access: AccessLevel) -> Result<(), envelope::ApiError> {
     }
 }
 
-fn open_with_system(abs: &str) -> Result<(), String> {
+/// 打开文件：opener 为指定应用（[openers] 配置）；None 走系统默认。
+/// macOS：.app 路径或应用名走 `open -a`；含 / 但非 .app 视为可执行文件直接拉起；
+/// Windows/Linux：直接拉起可执行文件（文件路径作为参数）
+fn open_with_system(abs: &str, opener: Option<&str>) -> Result<(), String> {
+    if let Some(app) = opener {
+        if app.trim().is_empty() {
+            return open_with_system(abs, None);
+        }
+        #[cfg(target_os = "macos")]
+        let mut cmd = {
+            if app.ends_with(".app") || !app.contains('/') {
+                // .app 路径或应用名：LaunchServices 解析
+                let mut c = std::process::Command::new("open");
+                c.args(["-a", app, abs]);
+                c
+            } else {
+                // 可执行文件路径：直接拉起，文件作参数
+                let mut c = std::process::Command::new(app);
+                c.arg(abs);
+                c
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mut cmd = {
+            let mut c = std::process::Command::new(app);
+            c.arg(abs);
+            c
+        };
+        let _ = &mut cmd;
+        return cmd
+            .status()
+            .map_err(|e| format!("指定应用打开失败（{app}）: {e}"))
+            .and_then(|s| if s.success() { Ok(()) } else { Err(format!("指定应用打开失败（{app}）: {s}")) });
+    }
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut c = std::process::Command::new("open");

@@ -357,7 +357,7 @@ async fn trash_clear(
 
 // ---------- library ----------
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct LibraryInfo {
     name: String,
     path: String,
@@ -365,20 +365,19 @@ struct LibraryInfo {
     application_version: String,
     storage_mode: String,
     scan: ScanInfo,
+    /// 打开方式（扩展名 → 指定应用；.sumi/config.toml 的 [openers]）
+    openers: std::collections::HashMap<String, String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct ScanInfo {
     periodic: bool,
     interval: u64,
 }
 
-/// `GET /api/v1/library/info`
-#[utoipa::path(get, path = "/api/v1/library/info", tag = "library",
-    responses((status = 200, description = "OK")))]
-async fn library_info_get(State(state): State<SharedState>) -> impl IntoResponse {
+fn library_info_data(state: &AppState) -> LibraryInfo {
     let config = state.config.current();
-    let info = LibraryInfo {
+    LibraryInfo {
         name: state.config.display_name(&state.paths.root),
         path: state.paths.root.clone(),
         modification_time: crate::core::paths::file_mtime_ms(&state.paths.root),
@@ -388,49 +387,79 @@ async fn library_info_get(State(state): State<SharedState>) -> impl IntoResponse
             periodic: config.scan.periodic,
             interval: config.scan.interval,
         },
-    };
-    axum::Json(serde_json::json!({ "status": "success", "data": info }))
+        openers: config.openers.clone(),
+    }
+}
+
+/// `GET /api/v1/library/info`
+#[utoipa::path(get, path = "/api/v1/library/info", tag = "library",
+    responses((status = 200, description = "OK", body = LibraryInfo)))]
+async fn library_info_get(State(state): State<SharedState>) -> impl IntoResponse {
+    axum::Json(serde_json::json!({ "status": "success", "data": library_info_data(&state) }))
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
-struct LibraryNameBody {
-    name: String,
+#[serde(deny_unknown_fields)]
+struct LibraryPatchBody {
+    /// 书库显示名（缺省不修改；空串表示清除）
+    #[serde(default)]
+    name: Option<String>,
+    /// 打开方式整体替换（缺省不修改）：扩展名 → 应用；空 map 表示全部清除
+    #[serde(default)]
+    openers: Option<std::collections::HashMap<String, String>>,
 }
 
-/// `PATCH /api/v1/library/info`：改库显示名（写 config.toml，广播 library.updated）
+/// `PATCH /api/v1/library/info`：改库显示名 / 打开方式（写 config.toml，广播 library.updated）
 #[utoipa::path(patch, path = "/api/v1/library/info", tag = "library",
-    request_body = LibraryNameBody, responses((status = 200, description = "OK")))]
+    request_body = LibraryPatchBody, responses((status = 200, description = "OK")))]
 async fn library_info_patch(
     State(state): State<SharedState>,
     Extension(access): Extension<AccessLevel>,
-    envelope::JsonBody(body): envelope::JsonBody<LibraryNameBody>,
+    envelope::JsonBody(body): envelope::JsonBody<LibraryPatchBody>,
 ) -> Result<impl IntoResponse, envelope::ApiError> {
     require_writable(access)?;
-    let name = body.name.trim();
+    // 打开方式校验：路径型值（含 / 或 \\）必须存在；应用名/命令名无法预检，放行（LaunchServices 或运行时解析）
+    if let Some(openers) = &body.openers {
+        for (ext, app) in openers {
+            if ext.trim().trim_start_matches('.').is_empty() {
+                return Err(envelope::ApiError::invalid_param("扩展名不能为空"));
+            }
+            let v = app.trim();
+            if v.is_empty() {
+                return Err(envelope::ApiError::invalid_param(format!("应用不能为空（{ext}）")));
+            }
+            if (v.contains('/') || v.contains('\\')) && !std::path::Path::new(v).exists() {
+                return Err(envelope::ApiError::invalid_param(format!("应用路径不存在（{ext}）: {v}")));
+            }
+        }
+    }
+    let name = body.name.as_deref().map(str::trim);
+    let openers = body.openers.clone();
     state
         .config
         .edit(|doc| {
-            if name.is_empty() {
-                doc.as_table_mut().remove("name");
-            } else {
-                doc["name"] = toml_edit::value(name);
+            if let Some(name) = name {
+                if name.is_empty() {
+                    doc.as_table_mut().remove("name");
+                } else {
+                    doc["name"] = toml_edit::value(name);
+                }
+            }
+            if let Some(openers) = &openers {
+                // 整体替换 [openers] 段（保注释的逐键写回）
+                let mut table = toml_edit::Table::new();
+                let mut keys: Vec<_> = openers.keys().collect();
+                keys.sort();
+                for k in keys {
+                    table[k] = toml_edit::value(&openers[k]);
+                }
+                doc["openers"] = toml_edit::Item::Table(table);
             }
             Ok(())
         })
         .map_err(envelope::ApiError::internal)?;
     // 广播完整库信息
-    let config = state.config.current();
-    let info = LibraryInfo {
-        name: state.config.display_name(&state.paths.root),
-        path: state.paths.root.clone(),
-        modification_time: crate::core::paths::file_mtime_ms(&state.paths.root),
-        application_version: env!("CARGO_PKG_VERSION").to_string(),
-        storage_mode: state.store.mode().as_str().to_string(),
-        scan: ScanInfo {
-            periodic: config.scan.periodic,
-            interval: config.scan.interval,
-        },
-    };
+    let info = library_info_data(&state);
     state
         .bus
         .emit_json(crate::core::events::names::LIBRARY_UPDATED, &info);
@@ -462,15 +491,7 @@ async fn library_scan_put(
             Ok(())
         })
         .map_err(envelope::ApiError::internal)?;
-    let config = state.config.current();
-    let info = LibraryInfo {
-        name: state.config.display_name(&state.paths.root),
-        path: state.paths.root.clone(),
-        modification_time: crate::core::paths::file_mtime_ms(&state.paths.root),
-        application_version: env!("CARGO_PKG_VERSION").to_string(),
-        storage_mode: state.store.mode().as_str().to_string(),
-        scan: ScanInfo { periodic: config.scan.periodic, interval: config.scan.interval },
-    };
+    let info = library_info_data(&state);
     state
         .bus
         .emit_json(crate::core::events::names::LIBRARY_UPDATED, &info);

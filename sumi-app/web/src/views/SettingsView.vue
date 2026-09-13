@@ -43,6 +43,37 @@ async function saveName(): Promise<void> {
   }
 }
 
+// ---- 打开方式 ----
+const OPEN_EXTS = ['epub', 'pdf', 'txt', 'md', 'mobi', 'azw3', 'docx', 'cbz'] as const;
+const openers = ref<Record<string, string>>({});
+const openersSaving = ref(false);
+onMounted(async () => {
+  const info = await api<{ openers: Record<string, string> }>('/library/info');
+  openers.value = { ...info.openers };
+});
+
+async function pickOpener(ext: string): Promise<void> {
+  const picked = await shell()?.pickApp();
+  if (picked) {
+    openers.value = { ...openers.value, [ext]: picked };
+  }
+}
+
+async function saveOpeners(): Promise<void> {
+  openersSaving.value = true;
+  try {
+    // 清掉空值后整体替换（config.toml 的 [openers]）
+    const clean = Object.fromEntries(Object.entries(openers.value).filter(([, v]) => v.trim() !== ''));
+    await api('/library/info', { method: 'PATCH', body: { openers: clean } });
+    openers.value = clean;
+    ui.toast('已保存（立即生效）');
+  } catch (e) {
+    ui.toastError(e);
+  } finally {
+    openersSaving.value = false;
+  }
+}
+
 async function switchStorage(mode: string): Promise<void> {
   if (mode === storageMode.value) {
     return;
@@ -201,6 +232,20 @@ const lockEntries = computed(() => {
           </div>
         </template>
 
+        <!-- 打开方式 -->
+        <template v-else-if="ui.settingsTab === 'openers'">
+          <h3>打开方式</h3>
+          <p class="hint">按格式指定打开书籍的应用（未指定 = 系统默认应用）。
+          macOS 支持 .app 路径 / 应用名 / 可执行文件路径；Windows/Linux 填可执行文件路径。</p>
+          <div v-for="ext in OPEN_EXTS" :key="ext" class="form-row">
+            <span class="form-label">.{{ ext }}</span>
+            <input v-model="openers[ext]" type="text" placeholder="系统默认" :disabled="!conn.writable" class="opener-input" />
+            <button v-if="shell() && conn.writable" class="btn small" @click="pickOpener(ext)">选择…</button>
+            <button v-if="conn.writable && openers[ext]" class="btn small" @click="openers[ext] = ''">清除</button>
+          </div>
+          <button v-if="conn.writable" class="btn" :disabled="openersSaving" @click="saveOpeners">保存</button>
+        </template>
+
         <!-- 扫描 -->
         <template v-else-if="ui.settingsTab === 'scan'">
           <h3>周期扫描</h3>
@@ -357,6 +402,10 @@ h4 {
   margin-top: 14px;
   font-size: 12px;
   color: var(--ok);
+}
+.opener-input {
+  flex: 1;
+  min-width: 0;
 }
 .lock-list {
   display: flex;

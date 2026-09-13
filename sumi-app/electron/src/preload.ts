@@ -14,6 +14,7 @@ const api: SumiShell = {
   openFolder: (relPath) => ipcRenderer.invoke(IPC.openFolder, relPath),
   getPathForFile: (file) => ipcRenderer.invoke(IPC.getPathForFile, file),
   lanAddresses: () => ipcRenderer.invoke(IPC.lanAddresses),
+  pickApp: () => ipcRenderer.invoke(IPC.pickApp),
   getCacheDir: () => ipcRenderer.invoke(IPC.cacheDirGet),
   pickCacheDir: () => ipcRenderer.invoke(IPC.cacheDirPick),
   setCacheDir: (p) => ipcRenderer.invoke(IPC.cacheDirSet, p),

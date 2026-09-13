@@ -60,6 +60,9 @@ pub struct LibraryConfigSnapshot {
     pub ignore: Vec<String>,
     /// None = 缺省（v1 支持格式全集）；Some = 用户显式配置
     pub extensions: Option<Vec<String>>,
+    /// 打开方式：扩展名（小写，无点）→ 指定应用（.app 路径/应用名/可执行文件路径）；
+    /// 未配置的扩展名走系统默认应用
+    pub openers: std::collections::HashMap<String, String>,
     pub scan: ScanConfig,
     pub web: WebConfig,
 }
@@ -119,6 +122,13 @@ ignore = []
 # （缺省为 v1 支持格式全集：epub/pdf/txt/md/mobi/azw3/docx/cbz）
 # extensions = ["epub", "pdf", "txt", "md"]
 
+# 打开方式：按扩展名指定打开应用（不配置 = 系统默认应用）。
+# macOS 支持 .app 路径（/Applications/Calibre.app）、应用名（Calibre）与可执行文件路径；
+# Windows/Linux 填可执行文件路径
+# [openers]
+# pdf = "/Applications/Adobe Acrobat Reader.app"
+# epub = "Calibre"
+
 # 周期兜底重扫（监听漏事件的最终一致保证）
 [scan]
 periodic = true
@@ -143,6 +153,8 @@ struct RawConfig {
     ignore: Vec<String>,
     #[serde(default)]
     extensions: Option<Vec<String>>,
+    #[serde(default)]
+    openers: std::collections::HashMap<String, String>,
     #[serde(default)]
     scan: RawScan,
     #[serde(default)]
@@ -242,10 +254,25 @@ impl LibraryConfig {
             separate_write_token: raw.web.separate_write_token,
             write_token: raw.web.write_token,
         };
+        // 扩展名键规范化为小写无点（配置里写 PDF / .pdf 都能命中）
+        let openers: std::collections::HashMap<String, String> = raw
+            .openers
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let key = k.trim().trim_start_matches('.').to_lowercase();
+                let value = v.trim().to_string();
+                if key.is_empty() || value.is_empty() {
+                    None
+                } else {
+                    Some((key, value))
+                }
+            })
+            .collect();
         Ok(LibraryConfigSnapshot {
             name: raw.name,
             ignore: raw.ignore,
             extensions: raw.extensions,
+            openers,
             scan,
             web,
         })

@@ -16,7 +16,7 @@ export const useUi = defineStore('ui', {
     selectedId: null as string | null,
     /** 详情侧板直接进编辑态（上下文菜单「编辑元数据」置位，Inspector 消费后复位） */
     inspectorEdit: false,
-    settingsTab: 'library' as 'library' | 'scan' | 'lan' | 'cache' | 'locks' | 'about',
+    settingsTab: 'library' as 'library' | 'openers' | 'scan' | 'lan' | 'cache' | 'locks' | 'about',
     toasts: [] as Toast[],
   }),
   actions: {

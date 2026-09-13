@@ -705,7 +705,7 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        /** `PATCH /api/v1/library/info`：改库显示名（写 config.toml，广播 library.updated） */
+        /** `PATCH /api/v1/library/info`：改库显示名 / 打开方式（写 config.toml，广播 library.updated） */
         patch: operations["library_info_patch"];
         trace?: never;
     };
@@ -1225,8 +1225,26 @@ export interface components {
             /** Format: int64 */
             started_unix_ms: number;
         };
-        LibraryNameBody: {
+        LibraryInfo: {
+            application_version: string;
+            /** Format: int64 */
+            modification_time: number;
             name: string;
+            /** @description 打开方式（扩展名 → 指定应用；.sumi/config.toml 的 [openers]） */
+            openers: {
+                [key: string]: string;
+            };
+            path: string;
+            scan: components["schemas"]["ScanInfo"];
+            storage_mode: string;
+        };
+        LibraryPatchBody: {
+            /** @description 书库显示名（缺省不修改；空串表示清除） */
+            name?: string | null;
+            /** @description 打开方式整体替换（缺省不修改）：扩展名 → 应用；空 map 表示全部清除 */
+            openers?: {
+                [key: string]: string;
+            } | null;
         };
         ListData: {
             items: components["schemas"]["ItemDto"][];
@@ -1312,6 +1330,11 @@ export interface components {
         ScanBody: {
             /** Format: int64 */
             interval?: number | null;
+            periodic: boolean;
+        };
+        ScanInfo: {
+            /** Format: int64 */
+            interval: number;
             periodic: boolean;
         };
         SkeletonData: {
@@ -2305,7 +2328,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["LibraryInfo"];
+                };
             };
         };
     };
@@ -2318,7 +2343,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["LibraryNameBody"];
+                "application/json": components["schemas"]["LibraryPatchBody"];
             };
         };
         responses: {

@@ -277,13 +277,16 @@ sumi-daemon 单实例对应单个书库。
 
 `PATCH /api/v1/library/info`
 
-改库显示名：写库内 `.sumi/config.toml` 的 `name` 键（toml_edit 保注释，保存即热更）；空白名清除自定义名（回退库目录名）。成功后就地广播 `library.updated`（负载为完整库信息），各客户端对齐无需重拉。响应同 `info`。
+改库显示名 / 打开方式：写库内 `.sumi/config.toml`（toml_edit 保注释，保存即热更）。空白名清除自定义名（回退库目录名）；`openers` 提供时整体替换 `[openers]` 段（空 map 全部清除）。成功后就地广播 `library.updated`（负载为完整库信息），各客户端对齐无需重拉。响应同 `info`。
+
+打开方式校验：应用值含路径分隔符时必须存在（否则 `INVALID_PARAM`）；不含路径分隔符的值按应用名/命令名放行（LaunchServices 或运行时解析）。
 
 #### 请求
 
-| 参数 | 类型   | 必填 | 说明         |
-| ---- | ------ | ---- | ------------ |
-| name | string | 是   | 新显示名     |
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| name | string | 否 | 新显示名（缺省不修改；空串清除） |
+| openers | object | 否 | 打开方式整体替换：扩展名 → 应用（.app 路径 / 应用名 / 可执行文件路径） |
 
 ### scan
 
@@ -957,6 +960,8 @@ multipart/form-data 上传新 item（web 端用）：浏览器无本地文件路
 `POST /api/v1/item/open`
 
 用操作系统默认应用打开原书文件（macOS `open` / Windows `ShellExecute` / Linux `xdg-open`）。桌面端「双击/回车打开」行为由此端点承载——v1 无内置阅读器，点击查看体验即「调起系统软件」。
+
+**打开方式可定制**：`.sumi/config.toml` 的 `[openers]` 按扩展名指定打开应用（如 `pdf` 用 Acrobat、`epub` 用 Calibre）；未配置的扩展名走系统默认应用。配置方式见 `PATCH /api/v1/library/info`；macOS 支持 `.app` 路径（`/Applications/Calibre.app`）、应用名（`Calibre`）与可执行文件路径，Windows/Linux 填可执行文件路径（文件路径作为参数拉起）。
 
 **admin 限定**：viewer（含可写）返回 403 `READ_ONLY`——该端点操作的是 daemon 所在机器的 GUI 会话，局域网 web 客户端调用无意义且危险。无头服务器部署形态下系统调用自然失败，返回 `OPEN_FAILED`。
 

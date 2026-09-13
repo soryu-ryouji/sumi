@@ -14,6 +14,7 @@ export const IPC = {
   openFolder: 'sumi:open-folder',
   getPathForFile: 'sumi:get-path-for-file',
   lanAddresses: 'sumi:lan-addresses',
+  pickApp: 'sumi:pick-app',
   cacheDirGet: 'sumi:cache-dir-get',
   cacheDirPick: 'sumi:cache-dir-pick',
   cacheDirSet: 'sumi:cache-dir-set',
@@ -78,6 +79,8 @@ export interface SumiShell {
   getPathForFile(file: File): Promise<string>;
   /** 本机局域网 IPv4 地址列表（设置面板展示用；LAN 配置读写走 REST app/lan） */
   lanAddresses(): Promise<string[]>;
+  /** 弹应用选择框（打开方式配置用；macOS 可选 .app，Windows/Linux 选可执行文件）。取消返回 null */
+  pickApp(): Promise<string | null>;
   /** 当前缓存父目录（isDefault=true 表示 daemon 系统默认） */
   getCacheDir(): Promise<{ current: string; isDefault: boolean }>;
   /** 弹目录选择框选新缓存父目录（取消返回 null） */

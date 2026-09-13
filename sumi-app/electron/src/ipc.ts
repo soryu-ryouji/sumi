@@ -131,6 +131,20 @@ export function registerIpc(): void {
     return out;
   });
 
+  // 应用选择框（打开方式配置用）：macOS 文件选择器可直接选中 .app 包
+  ipcMain.handle(IPC.pickApp, async (): Promise<string | null> => {
+    const win = getMainWindow();
+    if (!win) {
+      return null;
+    }
+    const result = await dialog.showOpenDialog(win, {
+      title: '选择应用',
+      properties: ['openFile'],
+      ...(process.platform === 'win32' ? { filters: [{ name: '应用程序', extensions: ['exe', 'bat', 'cmd', 'lnk'] }] } : {}),
+    });
+    return result.canceled ? null : result.filePaths[0];
+  });
+
   ipcMain.handle(IPC.cacheDirGet, (): { current: string; isDefault: boolean } => {
     const cacheParent = readConfig().cacheParent;
     return { current: cacheParent ?? '系统默认（按平台缓存目录下的 sumi/cache）', isDefault: !cacheParent };

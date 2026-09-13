@@ -225,6 +225,13 @@ ignore = ["node_modules", "*.tmp"]
 # （缺省为 v1 支持格式全集：epub/pdf/txt/md/mobi/azw3/docx/cbz，见 API 文档「支持格式」）
 # extensions = ["epub", "pdf", "txt", "md"]
 
+# 打开方式：按扩展名指定打开应用（不配置 = 系统默认应用）。
+# macOS 支持 .app 路径（/Applications/Calibre.app）、应用名（Calibre）与可执行文件路径；
+# Windows/Linux 填可执行文件路径
+# [openers]
+# pdf = "/Applications/Adobe Acrobat Reader.app"
+# epub = "Calibre"
+
 # 周期兜底重扫（监听漏事件的最终一致保证；设置面板「存储」分区可开关）
 [scan]
 periodic = true
@@ -241,6 +248,8 @@ write_token = ""     # 拆分模式下的可写 token
 ```
 
 `extensions`（可见扩展名白名单）保存即热生效：变化触发一次强制重扫，白名单外的既有条目从索引移除（文件本身不动，非侵入式；`library/cleanup_index` 亦可手动清理），新加入白名单的后缀随即入库；回收站不参与过滤（已回收的书籍仍可见、可恢复）。入库入口（`item/add`、`item/upload`）对白名单外的格式直接拒绝（`UNSUPPORTED_FORMAT`），`ignore` 命中拒绝（`INVALID_PARAM`）；`item/update` 的改名/移动目标同样受此约束。
+
+`[openers]` 保存即热生效：`item/open` 打开文件时按扩展名查表，未配置的走系统默认应用（见 API 文档 `PATCH /library/info`）。
 
 `[scan]` 保存即热生效（见 API 文档 `library/scan`）。
 

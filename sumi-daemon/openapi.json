@@ -996,7 +996,14 @@
         "operationId": "library_info_get",
         "responses": {
           "200": {
-            "description": "OK"
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryInfo"
+                }
+              }
+            }
           }
         }
       },
@@ -1004,13 +1011,13 @@
         "tags": [
           "library"
         ],
-        "summary": "`PATCH /api/v1/library/info`：改库显示名（写 config.toml，广播 library.updated）",
+        "summary": "`PATCH /api/v1/library/info`：改库显示名 / 打开方式（写 config.toml，广播 library.updated）",
         "operationId": "library_info_patch",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/LibraryNameBody"
+                "$ref": "#/components/schemas/LibraryPatchBody"
               }
             }
           },
@@ -2207,16 +2214,74 @@
           }
         }
       },
-      "LibraryNameBody": {
+      "LibraryInfo": {
         "type": "object",
         "required": [
-          "name"
+          "name",
+          "path",
+          "modification_time",
+          "application_version",
+          "storage_mode",
+          "scan",
+          "openers"
         ],
         "properties": {
+          "application_version": {
+            "type": "string"
+          },
+          "modification_time": {
+            "type": "integer",
+            "format": "int64"
+          },
           "name": {
+            "type": "string"
+          },
+          "openers": {
+            "type": "object",
+            "description": "打开方式（扩展名 → 指定应用；.sumi/config.toml 的 [openers]）",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "path": {
+            "type": "string"
+          },
+          "scan": {
+            "$ref": "#/components/schemas/ScanInfo"
+          },
+          "storage_mode": {
             "type": "string"
           }
         }
+      },
+      "LibraryPatchBody": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "书库显示名（缺省不修改；空串表示清除）"
+          },
+          "openers": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "打开方式整体替换（缺省不修改）：扩展名 → 应用；空 map 表示全部清除",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "ListData": {
         "type": "object",
@@ -2592,6 +2657,23 @@
               "integer",
               "null"
             ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "periodic": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ScanInfo": {
+        "type": "object",
+        "required": [
+          "periodic",
+          "interval"
+        ],
+        "properties": {
+          "interval": {
+            "type": "integer",
             "format": "int64",
             "minimum": 0
           },
