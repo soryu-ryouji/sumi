@@ -7,6 +7,7 @@ import { useLibrary } from '@/stores/library';
 import { useConnection } from '@/stores/connection';
 import { api, directUrl } from '@/shared/api/client';
 import { formatTime } from '@/shared/format';
+import DragBar from '@/app/chrome/DragBar.vue';
 import type { Item } from '@/shared/api/types';
 
 const books = useBooks();
@@ -57,12 +58,12 @@ async function clearAll(): Promise<void> {
 
 <template>
   <div class="trash-view">
-    <div class="trash-top">
-      <button class="btn" @click="back">← 返回书库</button>
-      <div class="trash-title">回收站<span class="trash-count">（{{ books.total }} 本）</span></div>
+    <DragBar title="回收站">
+      <span class="trash-count">共 {{ books.total }} 本</span>
       <div class="spacer" />
       <button v-if="conn.writable && books.total > 0" class="btn danger" :disabled="clearing" @click="clearAll">清空回收站</button>
-    </div>
+      <button class="btn" @click="back">← 返回书库</button>
+    </DragBar>
     <div class="trash-list">
       <div v-for="item in books.items" :key="item.id" class="trash-item">
         <img class="trash-cover" :src="directUrl('/item/cover', { id: item.id })" :alt="item.title" loading="lazy" />
@@ -85,21 +86,8 @@ async function clearAll(): Promise<void> {
   flex-direction: column;
   min-height: 0;
 }
-.trash-top {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel);
-}
-.trash-title {
-  font-size: 14px;
-  font-weight: 600;
-}
 .trash-count {
   color: var(--muted);
-  font-weight: 400;
   font-size: 12px;
 }
 .spacer {

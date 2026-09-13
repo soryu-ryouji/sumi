@@ -1,15 +1,18 @@
 <script setup lang="ts">
-// 侧栏：文件夹树 + 分类/标签/作者/系列聚合（点击筛选；锁名目提示；入口组）。
+// 侧栏：顶部拖拽条（macOS 红绿灯压左端，内容只放右端）+ 文件夹树 + 分类/标签/作者/系列聚合。
 import { computed } from 'vue';
 import { useLibrary } from '@/stores/library';
 import { useBooks } from '@/stores/books';
 import { useUi } from '@/stores/ui';
+import { hasShell, isMac, TRAFFIC_INSET, dragDoubleclickMaximize } from '@/shared/lib/platform';
+import { shell } from '@/app/shell';
 import type { CountEntry } from '@/shared/api/types';
 import FolderTreeNode from './FolderTreeNode.vue';
 
 const library = useLibrary();
 const books = useBooks();
 const ui = useUi();
+const showBrand = !isMac();
 
 const dimensions = computed(() => [
   { key: 'category', title: '分类', field: 'categories' as const, entries: library.categories },
@@ -71,6 +74,15 @@ const entryCount = (e: CountEntry) => e.count;
 
 <template>
   <aside class="sidebar">
+    <!-- 顶部拖拽条：侧栏色块通高到窗口上沿；macOS 原生红绿灯压在本条左侧（左端留空），
+         右端为换库入口；Windows/Linux 左端为品牌标识（窗口控制在 fixed 右上角，不在此列） -->
+    <div class="sidebar-head" :style="isMac() ? { paddingLeft: TRAFFIC_INSET + 'px' } : {}" @dblclick="dragDoubleclickMaximize">
+      <template v-if="showBrand">
+        <img src="/icon.png" alt="" class="head-logo" />
+        <span class="head-name">sumi</span>
+      </template>
+      <button v-if="hasShell()" class="head-btn" title="切换书库" @click="shell()?.selectLibrary()" @dblclick.stop>⇄</button>
+    </div>
     <div class="sidebar-scroll">
       <div class="sidebar-section">
         <div class="sidebar-head"><span class="sidebar-title">{{ library.libraryName || '书库' }}</span></div>
@@ -101,7 +113,6 @@ const entryCount = (e: CountEntry) => e.count;
     </div>
   </aside>
 </template>
-
 <style scoped>
 .sidebar {
   width: 220px;
@@ -111,6 +122,43 @@ const entryCount = (e: CountEntry) => e.count;
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+.sidebar-head {
+  flex: none;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  /* macOS：左端留出原生红绿灯区域（红绿灯压在本条上），经动态 style 注入；其余平台从左展示品牌 */
+  -webkit-app-region: drag;
+  border-bottom: 1px solid var(--border);
+}
+/* 条在拖拽区内，按钮须退出拖拽 */
+.head-btn {
+  -webkit-app-region: no-drag;
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+}
+.head-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.head-logo {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+}
+.head-name {
+  font-size: 12px;
+  color: var(--muted);
 }
 .sidebar-scroll {
   flex: 1;

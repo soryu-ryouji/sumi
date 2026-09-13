@@ -1,5 +1,7 @@
 <script setup lang="ts">
 // 顶层状态机：无连接（引导页）→ 连接中（启动屏）→ 主界面。
+// 窗口拖拽区由各视图顶部承担（DragBar / 侧栏顶条 / TopBar），无整窗通栏标题栏；
+// Windows/Linux 的窗口控制为 fixed 右上角（内容按 CONTROLS_INSET 避让）。
 // server 错误覆盖层在最外层兜底。
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { useConnection } from '@/stores/connection';
@@ -7,7 +9,7 @@ import { boot } from './boot';
 import { shell } from './shell';
 import ConnectScreen from './screens/ConnectScreen.vue';
 import StartingScreen from './screens/StartingScreen.vue';
-import TitleBar from './chrome/TitleBar.vue';
+import WindowControls from './chrome/WindowControls.vue';
 import MainView from '@/views/MainView.vue';
 import ReaderView from '@/views/ReaderView.vue';
 import TrashView from '@/views/TrashView.vue';
@@ -44,7 +46,7 @@ function quitApp(): void {
 
 <template>
   <div class="app-root">
-    <TitleBar />
+    <WindowControls />
     <div v-if="serverError" class="fatal-error">
       <div class="fatal-card">
         <h2>后端服务异常</h2>

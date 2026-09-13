@@ -6,6 +6,7 @@ import { useUi } from '@/stores/ui';
 import { useConnection } from '@/stores/connection';
 import { api, ApiError } from '@/shared/api/client';
 import { shell } from '@/app/shell';
+import { hasShell, isMac, CONTROLS_INSET, dragDoubleclickMaximize } from '@/shared/lib/platform';
 import { formatBytes } from '@/shared/format';
 
 const books = useBooks();
@@ -108,7 +109,13 @@ function toggleOrder(): void {
 </script>
 
 <template>
-  <div class="topbar" @drop="onDrop" @dragover.prevent>
+  <div
+    class="topbar"
+    :style="hasShell() && !isMac() ? { paddingRight: CONTROLS_INSET + 'px' } : {}"
+    @dblclick="dragDoubleclickMaximize"
+    @drop="onDrop"
+    @dragover.prevent
+  >
     <div class="search-box">
       <input v-model="searchText" type="text" class="search-input" :placeholder="searchMode === 'meta' ? '搜索书名 / 作者 / 备注…' : '全文检索正文内容…'" />
       <button class="mode-btn" :title="searchMode === 'meta' ? '切换为全文检索' : '切换为书目搜索'" @click="searchMode = searchMode === 'meta' ? 'content' : 'meta'">
@@ -135,7 +142,6 @@ function toggleOrder(): void {
       <input ref="fileInput" type="file" multiple hidden accept=".epub,.pdf,.txt,.md,.mobi,.azw3,.docx,.cbz" @change="onPick" />
       <button class="btn primary" @click="fileInput?.click()">添加书籍</button>
     </template>
-    <button class="btn" title="切换书库" @click="shell()?.selectLibrary()">换库</button>
     <button class="btn" title="设置" @click="ui.view = 'settings'">设置</button>
   </div>
 </template>
@@ -149,6 +155,14 @@ function toggleOrder(): void {
   border-bottom: 1px solid var(--border);
   background: var(--panel);
   flex: none;
+  /* 整条为窗口拖拽区（侧栏可见时本栏从侧栏右侧起，不与 mac 红绿灯相遇） */
+  -webkit-app-region: drag;
+}
+/* 交互控件退出拖拽区域 */
+.topbar button,
+.topbar input,
+.topbar select {
+  -webkit-app-region: no-drag;
 }
 .search-box {
   display: flex;

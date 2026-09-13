@@ -7,6 +7,7 @@ import { useBooks } from '@/stores/books';
 import { useConnection } from '@/stores/connection';
 import { api, directUrl } from '@/shared/api/client';
 import type { Item, TocEntry } from '@/shared/api/types';
+import DragBar from '@/app/chrome/DragBar.vue';
 
 const ui = useUi();
 const books = useBooks();
@@ -180,7 +181,7 @@ const showToc = computed(() => toc.value.length > 0);
 
 <template>
   <div v-if="item" class="reader">
-    <div class="reader-top">
+    <DragBar>
       <button class="btn" @click="ui.readerItemId = null">← 返回</button>
       <div class="reader-title">{{ item.title || item.name }}</div>
       <div class="reader-progress">
@@ -189,7 +190,7 @@ const showToc = computed(() => toc.value.length > 0);
       </div>
       <button v-if="conn.writable && item.read_status !== 'finished'" class="btn" @click="finish">读完</button>
       <button v-if="mode === 'unsupported'" class="btn" @click="openExternal">系统打开</button>
-    </div>
+    </DragBar>
 
     <div class="reader-body">
       <aside v-if="showToc" class="reader-toc">
@@ -225,15 +226,6 @@ const showToc = computed(() => toc.value.length > 0);
   display: flex;
   flex-direction: column;
   min-height: 0;
-}
-.reader-top {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel);
-  flex: none;
 }
 .reader-title {
   font-size: 14px;

@@ -7,6 +7,7 @@ import { useLibrary } from '@/stores/library';
 import { useConnection } from '@/stores/connection';
 import { api } from '@/shared/api/client';
 import { shell } from '@/app/shell';
+import DragBar from '@/app/chrome/DragBar.vue';
 import type { DimensionNames, LanConfig } from '@/shared/api/types';
 
 const ui = useUi();
@@ -177,15 +178,13 @@ const lockEntries = computed(() => {
 
 <template>
   <div class="settings">
-    <div class="settings-top">
-      <button class="btn" @click="ui.view = 'library'">← 返回</button>
-      <div class="settings-title">设置</div>
-    </div>
+    <DragBar title="设置" />
     <div class="settings-body">
       <nav class="settings-nav">
-        <button v-for="tab in TABS" :key="tab.key" class="nav-item" :class="{ active: ui.settingsTab === tab.key }" @click="ui.settingsTab = tab.key">
+        <button v-for="tab in TABS" :key="tab.key" class="nav-item" :class="{ active: ui.settingsTab === tab.key }" @click="ui.settingsTab = tab.key; ui.view = 'settings'">
           {{ tab.label }}
         </button>
+        <button class="nav-item back" @click="ui.view = 'library'">← 返回书库</button>
       </nav>
 
       <div class="settings-panel">
@@ -292,17 +291,6 @@ const lockEntries = computed(() => {
   flex-direction: column;
   min-height: 0;
 }
-.settings-top {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel);
-}
-.settings-title {
-  font-weight: 600;
-}
 .settings-body {
   flex: 1;
   display: flex;
@@ -334,6 +322,10 @@ const lockEntries = computed(() => {
 .nav-item.active {
   background: var(--accent-dim);
   color: #fff;
+}
+.nav-item.back {
+  margin-top: 12px;
+  color: var(--muted);
 }
 .settings-panel {
   flex: 1;

@@ -1,22 +1,40 @@
 <script setup lang="ts">
-// Windows/Linux 自绘窗口控制钮（macOS 用系统红绿灯，不渲染本组件）。
-defineProps<{ maximized: boolean }>();
-defineEmits<{ minimize: []; maximize: []; close: [] }>();
+// Windows/Linux 自绘窗口控制钮：fixed 窗口右上角（覆盖所有视图，内容区按 CONTROLS_INSET 避让）。
+// macOS 用系统原生红绿灯（titleBarStyle: 'hidden'，压在侧栏顶部拖拽条左侧），本组件不渲染；
+// 纯浏览器（无 Electron 壳）无窗口控制，同样不渲染。
+import { onMounted, onUnmounted, ref } from 'vue';
+import { shell } from '@/app/shell';
+
+const visible = shell() !== null && shell()?.platform !== 'darwin';
+const maximized = ref(false);
+let off: (() => void) | undefined;
+onMounted(() => {
+  off = shell()?.onWindowMaximized((v) => {
+    maximized.value = v;
+  });
+});
+onUnmounted(() => off?.());
+
+function toggleMaximize(): void {
+  void shell()?.toggleMaximizeWindow().then((v) => {
+    maximized.value = v;
+  });
+}
 </script>
 
 <template>
-  <div class="win-controls">
-    <button class="win-btn" title="最小化" @click="$emit('minimize')">
+  <div v-if="visible" class="win-controls">
+    <button class="win-btn" title="最小化" @click="shell()?.minimizeWindow()">
       <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor" /></svg>
     </button>
-    <button class="win-btn" :title="maximized ? '还原' : '最大化'" @click="$emit('maximize')">
+    <button class="win-btn" :title="maximized ? '还原' : '最大化'" @click="toggleMaximize">
       <svg v-if="!maximized" width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" /></svg>
       <svg v-else width="10" height="10" viewBox="0 0 10 10">
         <rect x="0.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" />
         <path d="M2.5 2.5v-2h7v7h-2" fill="none" stroke="currentColor" />
       </svg>
     </button>
-    <button class="win-btn close" title="关闭" @click="$emit('close')">
+    <button class="win-btn close" title="关闭" @click="shell()?.closeWindow()">
       <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10" stroke="currentColor" /></svg>
     </button>
   </div>
@@ -24,7 +42,12 @@ defineEmits<{ minimize: []; maximize: []; close: [] }>();
 
 <style scoped>
 .win-controls {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 500;
   display: flex;
+  height: 38px;
   -webkit-app-region: no-drag;
 }
 .win-btn {
@@ -33,7 +56,7 @@ defineEmits<{ minimize: []; maximize: []; close: [] }>();
   display: grid;
   place-items: center;
   border: none;
-  background: transparent;
+  background: var(--panel);
   color: var(--muted);
   cursor: default;
 }

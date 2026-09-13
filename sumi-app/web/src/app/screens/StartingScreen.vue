@@ -2,6 +2,7 @@
 // 启动屏：初始索引进度（sync/scan/hash/apply 四阶段，total=0 为不定态）。
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { shell } from '../shell';
+import DragBar from '../chrome/DragBar.vue';
 
 const phase = ref('');
 const processed = ref(0);
@@ -29,6 +30,8 @@ const percent = computed(() => (total.value > 0 ? Math.min(100, Math.round((proc
 
 <template>
   <div class="starting-screen">
+    <DragBar />
+    <div class="starting-center">
     <img src="/icon.png" alt="sumi" class="starting-logo" />
     <div class="starting-title">正在建立索引</div>
     <div class="starting-phase">{{ PHASE_LABEL[phase] ?? '准备中' }}</div>
@@ -36,11 +39,18 @@ const percent = computed(() => (total.value > 0 ? Math.min(100, Math.round((proc
       <div class="starting-bar-fill" :class="{ indeterminate: percent === null }" :style="percent !== null ? { width: percent + '%' } : {}" />
     </div>
     <div class="starting-count">{{ percent !== null ? `${percent}%（${processed}/${total}）` : '扫描书库中…' }}</div>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .starting-screen {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.starting-center {
   flex: 1;
   display: flex;
   flex-direction: column;

@@ -2,6 +2,7 @@
 // 引导页：无书库配置时的入口（选择目录 / 打开历史书库）。
 import { onMounted, ref } from 'vue';
 import { shell } from '../shell';
+import DragBar from '../chrome/DragBar.vue';
 import type { LibraryList } from '@/shared/api/types';
 
 const list = ref<LibraryList | null>(null);
@@ -39,6 +40,8 @@ async function remove(path: string): Promise<void> {
 
 <template>
   <div class="connect-screen">
+    <DragBar />
+    <div class="connect-center">
     <img src="/icon.png" alt="sumi" class="connect-logo" />
     <h1>sumi</h1>
     <p class="connect-sub">选择一个文件夹作为书库——书籍文件留在原地，sumi 的数据全部收在 .sumi/ 隐藏目录里。</p>
@@ -54,11 +57,18 @@ async function remove(path: string): Promise<void> {
         <button class="history-remove" title="从历史移除" @click="remove(lib.path)">✕</button>
       </div>
     </div>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .connect-screen {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.connect-center {
   flex: 1;
   display: flex;
   flex-direction: column;
