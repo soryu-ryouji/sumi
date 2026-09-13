@@ -80,9 +80,9 @@ pub fn generated_cover(title: &str, authors: &[String]) -> (Vec<u8>, u32, u32) {
 
     let author_line = authors.join(" · ");
     if let Some(font) = load_system_font() {
-        draw_text_centered(&mut canvas, title, w, 340.0, 52.0, 10.0, 6, &font);
+        draw_text_centered(&mut canvas, title, w, 340.0, 52.0, 10.0, 6, [245, 243, 238], &font);
         if !author_line.is_empty() {
-            draw_text_centered(&mut canvas, &author_line, w, 520.0, 30.0, 8.0, 4, &font);
+            draw_text_centered(&mut canvas, &author_line, w, 520.0, 30.0, 8.0, 4, [200, 198, 192], &font);
         }
     }
     // 无字体：纯渐变（文字封面不可用，等价降级）
@@ -90,6 +90,45 @@ pub fn generated_cover(title: &str, authors: &[String]) -> (Vec<u8>, u32, u32) {
     let img = DynamicImage::ImageRgba8(canvas);
     let webp = encode_webp(&img).unwrap_or_default();
     (webp, w, h)
+}
+
+/// 扉页封面：纯文字页排版（米色纸底 + 墨色文字，模拟书名页）。
+/// 用于 pdf 首页无嵌入位图时的回退——首页文字本身就是书名/作者信息
+pub fn text_page_cover(page_text: &str) -> Option<(Vec<u8>, u32, u32)> {
+    let font = load_system_font()?;
+    let lines: Vec<&str> = page_text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .take(16)
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let (w, h) = (600u32, 900u32);
+    let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([247, 245, 240, 255]));
+    let mut y = 120.0f32;
+    for (i, line) in lines.iter().enumerate() {
+        let size = if i == 0 { 34.0 } else { 22.0 }; // 首行（书名）略大
+        draw_text_centered(&mut canvas, line, w, y, size, 8.0, 3, [40, 38, 34], &font);
+        y += size + 14.0;
+    }
+    let img = DynamicImage::ImageRgba8(canvas);
+    encode_webp(&img).map(|bytes| (bytes, w, h))
+}
+
+/// 提取文字的可读性判定（subset CID 无 ToUnicode 的乱码识别）：
+/// 含 CJK 即可读；否则按「正常英文文本小写字母占比」判定——乱码偏移文几乎全大写/符号
+pub fn looks_readable(text: &str) -> bool {
+    let total = text.chars().filter(|c| c.is_alphanumeric()).count();
+    if total < 8 {
+        return false;
+    }
+    if text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        return true;
+    }
+    let lower = text.chars().filter(|c| c.is_lowercase()).count();
+    lower * 5 >= total
 }
 
 /// 平台系统字体候选（CJK 优先）；逐个尝试加载（ttc 取 face 0）
@@ -130,6 +169,7 @@ fn draw_text_centered(
     font_size: f32,
     line_gap: f32,
     max_lines: usize,
+    ink: [u8; 3],
     font: &fontdue::Font,
 ) {
     // 字符步进宽度（缺字形时按字号近似）
@@ -188,11 +228,11 @@ fn draw_text_centered(
                         continue;
                     }
                     let pixel = canvas.get_pixel_mut(px as u32, py as u32);
-                    // 字形为近白叠加（边缘抗锯齿按 alpha 与背景混合）
+                    // 墨色叠加（边缘抗锯齿按 alpha 与背景混合）
                     let a = alpha as u32;
-                    pixel[0] = ((245 * a + pixel[0] as u32 * (255 - a)) / 255) as u8;
-                    pixel[1] = ((243 * a + pixel[1] as u32 * (255 - a)) / 255) as u8;
-                    pixel[2] = ((238 * a + pixel[2] as u32 * (255 - a)) / 255) as u8;
+                    pixel[0] = ((ink[0] as u32 * a + pixel[0] as u32 * (255 - a)) / 255) as u8;
+                    pixel[1] = ((ink[1] as u32 * a + pixel[1] as u32 * (255 - a)) / 255) as u8;
+                    pixel[2] = ((ink[2] as u32 * a + pixel[2] as u32 * (255 - a)) / 255) as u8;
                 }
             }
             x += char_width(ch);
@@ -216,6 +256,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn readability_gate() {
+        assert!(looks_readable("重构：改善既有代码的设计"));        // 中文
+        assert!(looks_readable("The Pragmatic Programmer, 2nd ed"));// 正常英文
+        assert!(looks_readable("Computer Systems: A Programmer's Perspective"));
+        assert!(!looks_readable("0DUWLQ)RZOHU .HQW%HFN"));           // 偏移乱码(全大写+符号)
+        assert!(!looks_readable("6+B§X”8X"));                        // 短乱码
+        assert!(!looks_readable("   "));                              // 空
+        assert!(!looks_readable("abc"));                              // 太短
+    }
+
+    #[test]
+    fn text_page_cover_renders() {
+        let font = load_system_font();
+        if font.is_none() {
+            return; // 无系统字体环境(CI)跳过
+        }
+        let page = "重构\n改善既有代码的设计\nMartin Fowler 等著";
+        let (bytes, w, h) = text_page_cover(page).expect("扉页应生成");
+        assert_eq!((w, h), (600, 900));
+        assert_eq!(&bytes[..4], b"RIFF");
+        // 管线可解码且非全空白(有墨色文字)
+        let (webp, _, _) = (bytes.clone(), w, h);
+        let _ = webp;
+        let img = image::load_from_memory(&bytes).expect("webp 可解码");
+        let dark = img.to_rgba8().pixels().filter(|p| p[0] < 100).count();
+        assert!(dark > 500, "墨色文字像素过少: {dark}（疑似没画出字）");
+    }
+
+    #[test]
     fn generated_cover_shape() {
         let (bytes, w, h) = generated_cover("三体", &["刘慈欣".to_string()]);
         assert_eq!((w, h), (600, 900));
@@ -232,7 +301,7 @@ mod tests {
             return; // 无系统字体环境（CI）跳过
         }
         let mut canvas = image::RgbaImage::from_pixel(600, 900, image::Rgba([30, 40, 60, 255]));
-        draw_text_centered(&mut canvas, "三体", 600, 340.0, 52.0, 10.0, 6, font.as_ref().unwrap());
+        draw_text_centered(&mut canvas, "三体", 600, 340.0, 52.0, 10.0, 6, [245, 243, 238], font.as_ref().unwrap());
         // 文字为近白：大量近白像素（字形笔画）+ 抗锯齿边缘（中间色）都存在才算正常
         let white = canvas.pixels().filter(|p| p[0] > 200).count();
         let edge = canvas.pixels().filter(|p| p[0] > 100 && p[0] <= 200).count();

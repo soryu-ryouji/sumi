@@ -4,14 +4,15 @@
 use crate::core::parser::ParsedBook;
 use lopdf::{Document, Object};
 
-/// pdf 解析：Info 字典 Title/Author + 首页首图封面（无图不生成封面）
+/// pdf 解析：Info 字典 Title/Author + 首页首图封面（无图时首页文字排版作扉页封面）
 pub fn parse_pdf(name: &str, bytes: &[u8]) -> ParsedBook {
     let mut book = ParsedBook {
         title: name.to_string(),
         ..Default::default()
     };
-    if let Ok(doc) = Document::load_mem(bytes) {
-        let (title, author) = read_info(&doc);
+    let doc = Document::load_mem(bytes).ok();
+    if let Some(doc) = &doc {
+        let (title, author) = read_info(doc);
         if !title.is_empty() {
             book.title = title;
         }
@@ -20,6 +21,26 @@ pub fn parse_pdf(name: &str, bytes: &[u8]) -> ParsedBook {
         }
     }
     book.cover = extract_pdf_first_image(bytes);
+    if book.cover.is_none() {
+        // 纯排版首页（无嵌入位图）：首页文字可读才作扉页封面；乱码（subset CID 无 ToUnicode）
+        // 回退文件名排版封面
+        if let Some(doc) = &doc {
+            if let Some((&page_no, _)) = doc.get_pages().iter().next() {
+                if let Ok(text) = doc.extract_text(&[page_no]) {
+                    if crate::core::cover::looks_readable(&text) {
+                        if let Some((bytes, _, _)) = crate::core::cover::text_page_cover(&text) {
+                            book.cover = Some(bytes);
+                        }
+                    } else if !text.trim().is_empty() {
+                        let (bytes, _, _) = crate::core::cover::generated_cover(&book.title, &book.authors);
+                        if !bytes.is_empty() {
+                            book.cover = Some(bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
     book
 }
 
@@ -596,6 +617,7 @@ mod tests {
         assert!(extract_pdf_first_image(pdf).is_none());
     }
 }
+
 
 
 
