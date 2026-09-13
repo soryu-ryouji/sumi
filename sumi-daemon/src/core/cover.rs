@@ -21,7 +21,13 @@ fn pdfium() -> Option<&'static pdfium_render::prelude::Pdfium> {
             match bindings {
                 Some(b) => {
                     tracing::info!("pdfium 已加载（PDF 首页封面可用）");
-                    Some(Pdfium::new(b))
+                    let mut pdfium = Pdfium::new(b);
+                    // 平台默认字体提供者：未嵌入字体的文本渲染依赖系统字体
+                    // （不启用则中文标题等变豆腐块；失败不阻断，嵌入字体仍可用）
+                    if let Err(e) = pdfium.use_platform_default_font_provider() {
+                        tracing::warn!("pdfium 平台字体提供者不可用（未嵌入字体可能显示为方块）: {e}");
+                    }
+                    Some(pdfium)
                 }
                 None => {
                     tracing::warn!("pdfium 动态库不可用：PDF 封面回退排版生成（可设 SUMI_PDFIUM_PATH 指定库路径）");
@@ -154,13 +160,15 @@ pub fn generated_cover(title: &str, authors: &[String]) -> (Vec<u8>, u32, u32) {
     (webp, w, h)
 }
 
-/// 平台系统字体候选（CJK 优先）；逐个尝试加载（ttc 取 index 0）
-fn load_system_font() -> Option<ab_glyph::FontArc> {
+/// 平台系统字体候选（CJK 优先）；逐个尝试加载（ttc 取 face 0）
+fn load_system_font() -> Option<fontdue::Font> {
     const CANDIDATES: &[&str] = &[
-        // macOS
+        // macOS（新版系统已无 PingFang.ttc；冬青简体/黑体-简兜住中文）
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         // Windows
         "C:\\Windows\\Fonts\\msyh.ttc",
         "C:\\Windows\\Fonts\\simhei.ttf",
@@ -170,8 +178,11 @@ fn load_system_font() -> Option<ab_glyph::FontArc> {
     ];
     for path in CANDIDATES {
         if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(font) = ab_glyph::FontArc::try_from_vec(bytes) {
-                return Some(font);
+            if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
+                // 加载成功不代表支持中文：校验常用字有字形（缺字形字体验证会被豆腐块）
+                if font.lookup_glyph_index('中') != 0 && font.lookup_glyph_index('文') != 0 {
+                    return Some(font);
+                }
             }
         }
     }
@@ -187,20 +198,15 @@ fn draw_text_centered(
     font_size: f32,
     line_gap: f32,
     max_lines: usize,
-    font: &ab_glyph::FontArc,
+    font: &fontdue::Font,
 ) {
-    use ab_glyph::{Font as _, PxScale, ScaleFont};
-    let scale = PxScale::from(font_size);
-    let scaled = font.as_scaled(scale);
-    let ascent = scaled.ascent();
-
     // 字符步进宽度（缺字形时按字号近似）
     let char_width = |ch: char| -> f32 {
-        let gid = font.glyph_id(ch);
-        if gid.0 == 0 {
+        let idx = font.lookup_glyph_index(ch);
+        if idx == 0 {
             font_size * 0.6
         } else {
-            scaled.h_advance(gid)
+            font.metrics(ch, font_size).advance_width
         }
     };
 
@@ -230,22 +236,32 @@ fn draw_text_centered(
         let line_width: f32 = line.chars().map(|ch| char_width(ch)).sum();
         let mut x = ((cw as f32 - line_width) / 2.0).max(0.0);
         for ch in line.chars() {
-            let gid = font.glyph_id(ch);
-            let glyph = gid.with_scale_and_position(scale, ab_glyph::Point { x, y: y + ascent });
-            if let Some(outlined) = font.outline_glyph(glyph) {
-                let bounds = outlined.px_bounds();
-                outlined.draw(|gx, gy, coverage| {
-                    let px = bounds.min.x as i64 + gx as i64;
-                    let py = bounds.min.y as i64 + gy as i64;
-                    if px >= 0 && py >= 0 && (px as u32) < cw && (py as u32) < canvas.height() {
-                        let alpha = (coverage * 255.0) as u8;
-                        let pixel = canvas.get_pixel_mut(px as u32, py as u32);
-                        pixel[0] = 245;
-                        pixel[1] = 243;
-                        pixel[2] = 238;
-                        pixel[3] = pixel[3].max(alpha);
+            let (metrics, bitmap) = font.rasterize(ch, font_size);
+            // fontdue 坐标系：pen 起点在 baseline 左端；字形位图左上 = (pen_x + xmin, baseline - ymin - height)
+            let base_y = y + font_size; // baseline 估算：top + 字号（近似 ascent）
+            let x0 = (x + metrics.xmin as f32) as i64;
+            let y0 = (base_y - metrics.ymin as f32 - metrics.height as f32) as i64;
+            for j in 0..metrics.height {
+                let py = y0 + j as i64;
+                if py < 0 || py as u32 >= canvas.height() {
+                    continue;
+                }
+                for i in 0..metrics.width {
+                    let alpha = bitmap[j * metrics.width + i];
+                    if alpha == 0 {
+                        continue;
                     }
-                });
+                    let px = x0 + i as i64;
+                    if px < 0 || px as u32 >= cw {
+                        continue;
+                    }
+                    let pixel = canvas.get_pixel_mut(px as u32, py as u32);
+                    // 字形为近白叠加（边缘抗锯齿按 alpha 与背景混合）
+                    let a = alpha as u32;
+                    pixel[0] = ((245 * a + pixel[0] as u32 * (255 - a)) / 255) as u8;
+                    pixel[1] = ((243 * a + pixel[1] as u32 * (255 - a)) / 255) as u8;
+                    pixel[2] = ((238 * a + pixel[2] as u32 * (255 - a)) / 255) as u8;
+                }
             }
             x += char_width(ch);
         }
@@ -274,6 +290,24 @@ mod tests {
         // webp 魔数（RIFF....WEBP）
         assert_eq!(&bytes[..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WEBP");
+    }
+
+    /// 排版封面的文字必须真实绘制（防 ab_glyph 光栅器实心方块式失效回归）
+    #[test]
+    fn generated_cover_has_text_pixels() {
+        let font = load_system_font();
+        if font.is_none() {
+            return; // 无系统字体环境（CI）跳过
+        }
+        let mut canvas = image::RgbaImage::from_pixel(600, 900, image::Rgba([30, 40, 60, 255]));
+        draw_text_centered(&mut canvas, "三体", 600, 340.0, 52.0, 10.0, 6, font.as_ref().unwrap());
+        // 文字为近白：大量近白像素（字形笔画）+ 抗锯齿边缘（中间色）都存在才算正常
+        let white = canvas.pixels().filter(|p| p[0] > 200).count();
+        let edge = canvas.pixels().filter(|p| p[0] > 100 && p[0] <= 200).count();
+        assert!(white > 400, "文字笔画像素过少: {white}（疑似未绘制）");
+        assert!(edge > 50, "抗锯齿边缘像素过少: {edge}（疑似实心方块）");
+        // 且不是实心矩形：字形 bbox 区域内近白占比应远低于 100%
+        assert!(white < 600 * 900 / 10, "近白像素过多: {white}（疑似整片填充）");
     }
 
     #[test]
@@ -308,3 +342,5 @@ mod tests {
         buf.into_inner()
     }
 }
+
+
