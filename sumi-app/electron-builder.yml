@@ -17,6 +17,9 @@ extraResources:
   # 各平台 sumi-daemon 二进制（cargo build --release，见 scripts/build-server.mjs）
   - from: resources/sumi-daemon
     to: sumi-daemon
+  # pdfium 动态库（PDF 首页封面渲染，按平台子目录分发；缺失时 PDF 封面回退排版生成）
+  - from: resources/pdfium
+    to: pdfium
 # LAN web 查看（2.0 路线图）：daemon 以物理路径托管 web/dist（asar 归档内不可读取），先解包备用
 asarUnpack:
   - web/dist/**/*

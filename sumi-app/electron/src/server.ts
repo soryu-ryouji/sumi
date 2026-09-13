@@ -93,6 +93,26 @@ function probeFreePort(): Promise<number> {
  *   sumi:server-progress（starting 阶段进度）→ sumi:server-started（就绪，含地址与 token）→ sumi:server-error（失败原因）。
  * spawn 失败、异常退出（stopServer 除外）、停滞 120s 超时就 sumi:server-error。
  */
+/** pdfium 动态库路径（PDF 首页封面渲染；dev 探测 resources/pdfium，打包态 extraResources）。
+ *  未找到返回 undefined：daemon 缺库时 PDF 封面回退排版生成 */
+function pdfiumLibraryPath(): string | undefined {
+  const file = process.platform === 'win32' ? 'pdfium.dll' : process.platform === 'darwin' ? 'libpdfium.dylib' : 'libpdfium.so';
+  const rid: string | undefined = ({
+    'darwin-arm64': 'mac-arm64',
+    'darwin-x64': 'mac-x64',
+    'linux-x64': 'linux-x64',
+    'win32-x64': 'win-x64',
+  } as Record<string, string>)[`${process.platform}-${process.arch}`];
+  if (!rid) {
+    return undefined;
+  }
+  const candidates = [
+    path.join(process.resourcesPath, 'pdfium', rid, file), // 打包态
+    path.join(APP_DIR, 'resources', 'pdfium', rid, file), // 开发态（fetch-pdfium 拉到仓库 resources/）
+  ];
+  return candidates.find((p) => fs.existsSync(p));
+}
+
 function startServer(libPath: string, address: string, token: string): ServerHandle {
   const { command, args } = resolveServerCommand();
   // 全局缓存父目录（设置面板「存储」配置；未配置用系统默认）
@@ -109,7 +129,11 @@ function startServer(libPath: string, address: string, token: string): ServerHan
   // 新 server 的拉起，全局标志会被新一轮复位，造成误报异常退出
   let intentionalExit = false;
   const child = spawn(command, spawnArgs, {
-    env: { ...process.env, SUMI_TOKEN: token },
+    env: {
+      ...process.env,
+      SUMI_TOKEN: token,
+      ...(pdfiumLibraryPath() ? { SUMI_PDFIUM_PATH: pdfiumLibraryPath() } : {}),
+    },
     stdio: ['ignore', 'ignore', 'pipe'], // stdout 不承担协议（未设置 token 时会打印随机 token，忽略）
     // GUI 进程拉起控制台子进程：不隐藏会在 Windows 上弹出黑窗口
     windowsHide: true,

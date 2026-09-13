@@ -46,11 +46,36 @@ pub fn parse(name: &str, ext: &str, bytes: &[u8]) -> ParsedBook {
         "cbz" => cbz::parse_cbz(name, bytes),
         // mobi/azw3：EXTH 元数据与封面（KF8 正文提取列后续版本，v1 不产 fulltext）
         "mobi" | "azw3" => parse_mobi(name, bytes),
-        // pdf：v1 不做服务端解析（封面渲染/书签大纲依赖 pdfium 动态库，缺库降级空值；
-        // 阅读走 item/file + Range + pdf.js）
-        "pdf" => ParsedBook { title: name.to_string(), ..Default::default() },
+        // pdf：pdfium 首页渲染作封面 + 文档信息字典 Title/Author（库不可用时整体降级：
+        // 封面走排版生成链，标题回退文件名；阅读走 item/file + pdf.js）
+        "pdf" => parse_pdf(name, bytes),
         _ => ParsedBook { title: name.to_string(), ..Default::default() },
     }
+}
+
+/// pdf 解析：首页封面 + Info 字典元数据
+fn parse_pdf(name: &str, bytes: &[u8]) -> ParsedBook {
+    let mut book = ParsedBook {
+        title: name.to_string(),
+        ..Default::default()
+    };
+    if let Some((title, author)) = crate::core::cover::pdf_meta(bytes) {
+        book.title = title;
+        if !author.is_empty() {
+            book.authors = vec![author];
+        }
+    }
+    if let Some(img) = crate::core::cover::render_pdf_first_page(bytes) {
+        let mut png = Vec::new();
+        if img
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_ok()
+            && !png.is_empty()
+        {
+            book.cover = Some(png);
+        }
+    }
+    book
 }
 
 /// 解析结果回填 item（只覆盖非用户编辑字段）
@@ -164,5 +189,28 @@ mod tests {
         assert_eq!(book.title, "随便");
         assert!(book.cover.is_none());
         assert!(book.toc.is_empty());
+    }
+
+    /// 手工构造的单页 PDF（正确 xref；红色描边矩形，MediaBox 200×300）
+    const MINIMAL_PDF: &[u8] = &[
+        37, 80, 68, 70, 45, 49, 46, 52, 10, 49, 32, 48, 32, 111, 98, 106, 60, 60, 47, 84, 121, 112, 101, 47, 67, 97, 116, 97, 108, 111, 103, 47, 80, 97, 103, 101, 115, 32, 50, 32, 48, 32, 82, 62, 62, 101, 110, 100, 111, 98, 106, 10, 50, 32, 48, 32, 111, 98, 106, 60, 60, 47, 84, 121, 112, 101, 47, 80, 97, 103, 101, 115, 47, 75, 105, 100, 115, 91, 51, 32, 48, 32, 82, 93, 47, 67, 111, 117, 110, 116, 32, 49, 62, 62, 101, 110, 100, 111, 98, 106, 10, 51, 32, 48, 32, 111, 98, 106, 60, 60, 47, 84, 121, 112, 101, 47, 80, 97, 103, 101, 47, 80, 97, 114, 101, 110, 116, 32, 50, 32, 48, 32, 82, 47, 77, 101, 100, 105, 97, 66, 111, 120, 91, 48, 32, 48, 32, 50, 48, 48, 32, 51, 48, 48, 93, 47, 67, 111, 110, 116, 101, 110, 116, 115, 32, 52, 32, 48, 32, 82, 47, 82, 101, 115, 111, 117, 114, 99, 101, 115, 60, 60, 62, 62, 62, 62, 101, 110, 100, 111, 98, 106, 10, 52, 32, 48, 32, 111, 98, 106, 60, 60, 47, 76, 101, 110, 103, 116, 104, 32, 51, 49, 62, 62, 115, 116, 114, 101, 97, 109, 10, 49, 32, 48, 32, 48, 32, 82, 71, 32, 50, 32, 119, 32, 50, 48, 32, 50, 48, 32, 49, 54, 48, 32, 50, 54, 48, 32, 114, 101, 32, 83, 10, 101, 110, 100, 115, 116, 114, 101, 97, 109, 101, 110, 100, 111, 98, 106, 10, 120, 114, 101, 102, 10, 48, 32, 53, 10, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 32, 54, 53, 53, 51, 53, 32, 102, 32, 10, 48, 48, 48, 48, 48, 48, 48, 48, 48, 57, 32, 48, 48, 48, 48, 48, 32, 110, 32, 10, 48, 48, 48, 48, 48, 48, 48, 48, 53, 50, 32, 48, 48, 48, 48, 48, 32, 110, 32, 10, 48, 48, 48, 48, 48, 48, 48, 49, 48, 49, 32, 48, 48, 48, 48, 48, 32, 110, 32, 10, 48, 48, 48, 48, 48, 48, 48, 49, 57, 51, 32, 48, 48, 48, 48, 48, 32, 110, 32, 10, 116, 114, 97, 105, 108, 101, 114, 10, 60, 60, 47, 83, 105, 122, 101, 32, 53, 47, 82, 111, 111, 116, 32, 49, 32, 48, 32, 82, 62, 62, 10, 115, 116, 97, 114, 116, 120, 114, 101, 102, 10, 50, 54, 57, 10, 37, 37, 69, 79, 70, 10,
+    ];
+
+    /// pdf 解析降级链：pdfium 可用 → 首页封面（真渲染，宽高比与页面一致）；
+    /// 不可用（CI 无库）→ 空封面 + 文件名标题（排版封面链在 cover 管线兑底）
+    #[test]
+    fn pdf_parse_cover() {
+        let book = parse("凤凰项目", "pdf", MINIMAL_PDF);
+        assert_eq!(book.title, "凤凰项目");
+        if crate::core::cover::pdfium_available() {
+            let cover = book.cover.expect("pdfium 可用时应有首页封面");
+            // 走完封面管线（解码→缩放→webp）验证图像有效，且宽高比保持页面开本（200/300）
+            let processed = crate::core::cover::process_cover(&cover).expect("渲染产物应为有效图像");
+            let (_, w, h) = processed;
+            let ratio = w as f64 / h as f64;
+            assert!((ratio - 200.0 / 300.0).abs() < 0.05, "宽高比应接近页面开本: {w}x{h}");
+        } else {
+            assert!(book.cover.is_none(), "缺库时不应产出封面");
+        }
     }
 }

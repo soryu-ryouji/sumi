@@ -42,6 +42,7 @@ chardetng = "0.1"
 encoding_rs = "0.8"
 mobi = "0.8"
 ab_glyph = "0.2"
+pdfium-render = { version = "0.9.4", features = ["thread_safe"] }
 
 [profile.release]
 lto = true

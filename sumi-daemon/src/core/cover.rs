@@ -4,6 +4,68 @@
 
 use image::{DynamicImage, GenericImageView};
 
+// ---------- PDF 首页渲染（pdfium 动态库，可选能力） ----------
+
+/// pdfium 运行时（动态库）绑定。加载顺序：SUMI_PDFIUM_PATH 环境变量（打包态由 Electron
+/// 注入 extraResources 路径）→ 系统库搜索路径。绑定结果全局缓存（含失败：缺库时不逐书重试）
+static PDFIUM: std::sync::OnceLock<Option<pdfium_render::prelude::Pdfium>> = std::sync::OnceLock::new();
+
+fn pdfium() -> Option<&'static pdfium_render::prelude::Pdfium> {
+    PDFIUM
+        .get_or_init(|| {
+            use pdfium_render::prelude::*;
+            let bindings = match std::env::var("SUMI_PDFIUM_PATH") {
+                Ok(p) if !p.is_empty() => Pdfium::bind_to_library(&p).ok(),
+                _ => Pdfium::bind_to_system_library().ok(),
+            };
+            match bindings {
+                Some(b) => {
+                    tracing::info!("pdfium 已加载（PDF 首页封面可用）");
+                    Some(Pdfium::new(b))
+                }
+                None => {
+                    tracing::warn!("pdfium 动态库不可用：PDF 封面回退排版生成（可设 SUMI_PDFIUM_PATH 指定库路径）");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// pdfium 是否可用（测试与封面链路判定用）
+pub fn pdfium_available() -> bool {
+    pdfium().is_some()
+}
+
+/// 渲染 PDF 首页为图像（封面用；目标宽 800px，封面管线后续统一缩放入 1024）
+pub fn render_pdf_first_page(bytes: &[u8]) -> Option<DynamicImage> {
+    use pdfium_render::prelude::*;
+    let pdfium = pdfium()?;
+    let doc = pdfium.load_pdf_from_byte_slice(bytes, None).ok()?;
+    let page = doc.pages().get(0).ok()?;
+    let config = PdfRenderConfig::new().set_target_width(800);
+    let bitmap = page.render_with_config(&config).ok()?;
+    bitmap.as_image().ok()
+}
+
+/// PDF 文档信息字典的 Title/Author（空值回退 None）
+pub fn pdf_meta(bytes: &[u8]) -> Option<(String, String)> {
+    use pdfium_render::prelude::*;
+    let pdfium = pdfium()?;
+    let doc = pdfium.load_pdf_from_byte_slice(bytes, None).ok()?;
+    let title = doc
+        .metadata()
+        .get(PdfDocumentMetadataTagType::Title)
+        .map(|t| t.value().to_string())
+        .filter(|s| !s.trim().is_empty());
+    let author = doc
+        .metadata()
+        .get(PdfDocumentMetadataTagType::Author)
+        .map(|t| t.value().to_string())
+        .filter(|s| !s.trim().is_empty());
+    Some((title?, author.unwrap_or_default()))
+}
+
 /// 封面统一边长上限（等比缩入 1024，不放大）
 pub const COVER_MAX_EDGE: u32 = 1024;
 /// webp 有损质量（与 hawk 一致）
@@ -196,9 +258,9 @@ pub fn cache_cover_path(covers_dir: &str, id: &str) -> String {
     format!("{covers_dir}/{id}.webp")
 }
 
-/// 格式可即时生成排版封面（GET 封面的兜底链）
+/// 格式可即时生成排版封面（GET 封面的兜底链）；pdf 在 pdfium 缺库时同样回退排版封面
 pub fn can_generate_cover(ext: &str) -> bool {
-    matches!(ext, "txt" | "md" | "docx")
+    matches!(ext, "txt" | "md" | "docx" | "pdf")
 }
 
 #[cfg(test)]

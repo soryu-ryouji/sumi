@@ -28,7 +28,7 @@
 ./tools/install.sh             # Windows: ./tools/install.ps1
 
 # 开发
-bash tools/smoke.sh            # 后端端到端冒烟（46 项行为断言）
+bash tools/smoke.sh            # 后端端到端冒烟（48 项行为断言）
 cd sumi-app && npm run dev     # 桌面客户端开发模式（自动拉起后端）
 
 # 图标产物改版时重新生成（真源 .assets/sumi.svg，产物已入库）

@@ -97,7 +97,7 @@ SUMI_TOKEN=<token> sumi-daemon --library <书库路径> --port 27381 [--web-dist
 ## 已知简化（v1 后续打磨）
 
 - 解析派生（封面/元数据/FTS）在流水线内同步执行；worker 化（`CPU/4` 封顶 8 的 cover 队列）与 `task.progress` 的 500ms 节流推送待接入
-- pdf 解析未实现（pdfium 首页渲染/书签依赖动态库，打包阶段处理）：封面 404 占位 + toc 空数组，阅读走 `item/file` + pdf.js
+- pdf 首页封面与 Info 字典（Title/Author）经 pdfium 渲染（动态库可选：`SUMI_PDFIUM_PATH` 注入或系统搜索；缺失时封面回退排版生成）；书签大纲未做，阅读走 `item/file` + pdf.js
 - `item/content` 的 epub 归一化为章节级 HTML（spine 逐章 `<section id data-href>`，与 toc 锚点按 href 对位，章内资源引用逐属性改写为 `item/resource` 直链）；docx 为段落级 HTML；mobi 直出解包内容
 - watcher 的 rename 事件按 remove+add 防抖处理（周期扫描兜底收敛）；From/To 精确配对待加
 - `app/lan` 的监听 supervisor（`[web]` 热重绑）待接线：配置读写契约已完整
@@ -114,6 +114,6 @@ cargo test                     # 解析器单测（testdata/ 样例书）+ 流�
 ```
 
 - **testdata/**：每格式准备最小样例书（含中英文混合、多卷、无封面、损坏文件等边界样例），解析器单测逐格式覆盖
-- **tools/smoke.sh**：端到端冒烟（46 项行为断言：鉴权/入库/全文/封面/Range/用户编辑保护/分类/锁票据/回收站/文件夹/view/global_filter/rescan/回收站扫描存活/子树重扫/存储迁移/SSE）
+- **tools/smoke.sh**：端到端冒烟（48 项行为断言：鉴权/入库/全文/封面/Range/用户编辑保护/分类/锁票据/回收站/文件夹/view/global_filter/rescan/回收站扫描存活/子树重扫/存储迁移/SSE）
 - **契约测试**：`openapi.json` 固化文件与代码生成 schema 逐字一致（改 API 后 `cargo run -- --dump-openapi > openapi.json` 重新固化）
-PDFium 为 C++ 依赖：pdfium-render 随 crate 携带各平台预编译动态库（`pdfium-build` feature），无需本地工具链；打包时随 extraResources 分发。
+PDFium 为 C++ 依赖：动态库取 bblanchon/pdfium-binaries 预编译产物（sumi-app `scripts/fetch-pdfium.mjs` 按平台拉取），打包时随 extraResources 分发、由 Electron 经 `SUMI_PDFIUM_PATH` 注入 daemon。
