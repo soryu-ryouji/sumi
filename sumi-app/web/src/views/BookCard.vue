@@ -22,12 +22,26 @@ const loaded = ref(false);
 const failed = ref(false);
 
 const selected = computed(() => ui.selectedId === props.item.id);
-const coverUrl = computed(() => directUrl(`/item/cover`, { id: props.item.id }));
+const coverUrl = computed(() => {
+  const v = books.coverBust[props.item.id] ?? 0;
+  return directUrl(`/item/cover`, { id: props.item.id, v: String(v) });
+});
 
 const STATUS_BADGE: Record<string, string> = { reading: '读', finished: '完', abandoned: '弃' };
 const badge = computed(() => STATUS_BADGE[props.item.read_status] ?? '');
 
 const primary = computed(() => props.item.paths[0] ?? '');
+
+/** 刷新元数据（重建封面 + 重解析内嵌元数据，用户编辑字段受 overridden 保护） */
+async function refreshMetadata(): Promise<void> {
+  try {
+    await api('/item/refresh_metadata', { method: 'POST', body: { id: props.item.id } });
+    books.bumpCover(props.item.id);
+    ui.toast('已重建封面与元数据');
+  } catch (e) {
+    ui.toastError(e);
+  }
+}
 
 /** 系统默认应用打开（item/open，admin 限定） */
 async function openExternal(): Promise<void> {
@@ -68,6 +82,10 @@ function onContextMenu(e: MouseEvent): void {
     items.push({ label: '复制文件路径', action: copyPrimaryPath });
   }
   if (conn.writable) {
+    items.push({
+      label: '刷新元数据',
+      action: () => void refreshMetadata(),
+    });
     items.push({
       label: '编辑元数据',
       action: () => {

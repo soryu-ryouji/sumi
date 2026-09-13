@@ -134,9 +134,22 @@ async function saveLan(): Promise<void> {
 
 // ---- 缓存 ----
 const cache = ref<{ current: string; isDefault: boolean } | null>(null);
+const refreshingCache = ref(false);
 onMounted(async () => {
   cache.value = (await shell()?.getCacheDir()) ?? null;
 });
+/** 重建派生缓存（补缺失模式：封面缺失重生成、全文索引补齐；已存在的不动） */
+async function refreshCache(): Promise<void> {
+  refreshingCache.value = true;
+  try {
+    const res = await api<{ dispatched: number }>('/library/refresh_cache', { method: 'POST', body: { type: 'library' } });
+    ui.toast(`已派发 ${res.dispatched} 本重建（后台进行）`);
+  } catch (e) {
+    ui.toastError(e);
+  } finally {
+    refreshingCache.value = false;
+  }
+}
 async function pickCache(): Promise<void> {
   const picked = await shell()?.pickCacheDir();
   if (!picked) {
@@ -279,6 +292,9 @@ const lockEntries = computed(() => {
           <div class="form-row"><span class="form-label">当前位置</span><code class="cache-path">{{ cache?.current ?? '—' }}</code></div>
           <button class="btn" @click="pickCache">选择新目录…</button>
           <button v-if="cache && !cache.isDefault" class="btn" @click="resetCache">恢复默认</button>
+          <div style="height: 8px" />
+          <button v-if="conn.writable" class="btn" :disabled="refreshingCache" @click="refreshCache">重建缺失的封面与全文索引</button>
+          <p class="hint">逐本重建走右键菜单「刷新元数据」；强制全部重建可先删除缓存目录内容再重启。</p>
         </template>
 
         <!-- 锁 -->

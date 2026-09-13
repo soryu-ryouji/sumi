@@ -51,6 +51,8 @@ export const useBooks = defineStore('books', {
       order: 'desc',
     } as FilterState,
     items: [] as Item[],
+    /** item id → 封面缓存破坏版本号（refresh_metadata 后递增） */
+    coverBust: {} as Record<string, number>,
     total: 0,
     totalSize: 0,
     hasMore: false,
@@ -125,6 +127,11 @@ export const useBooks = defineStore('books', {
       if (idx >= 0) {
         this.items[idx] = item;
       }
+    },
+    /** 封面重建后的浏览器缓存破坏（封面 URL 带 Cache-Control: immutable，
+     *  内容变了 URL 不变，按 item 记版本号让 <img> 重新请求） */
+    bumpCover(id: string) {
+      this.coverBust[id] = (this.coverBust[id] ?? 0) + 1;
     },
     dropItem(id: string) {
       this.items = this.items.filter((i) => i.id !== id);
