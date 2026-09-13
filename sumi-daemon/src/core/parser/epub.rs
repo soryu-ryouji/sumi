@@ -77,6 +77,9 @@ struct Opf {
     manifest: Vec<ManifestItem>,
     spine: Vec<String>,
     cover_item_id: Option<String>,
+    /// metadata `<meta name="cover" content="<manifest id 或 href>">`（EPUB 2 / calibre 标准形态；
+    /// 与 item name 属性、EPUB 3 properties 三源合并，先到先得）
+    meta_cover_ref: Option<String>,
 }
 
 fn parse_opf(xml: &str) -> Opf {
@@ -98,13 +101,6 @@ fn parse_opf(xml: &str) -> Opf {
                     "manifest" => section = "mf".into(),
                     "spine" => {
                         section = "s".into();
-                        // spine 上的 toc 属性（NCX id）与 cover 属性（部分制作器）
-                        for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"toc" {
-                                opf.cover_item_id.get_or_insert_with(Default::default);
-                                let _ = attr;
-                            }
-                        }
                     }
                     _ => {}
                 }
@@ -112,10 +108,19 @@ fn parse_opf(xml: &str) -> Opf {
                     // dc:title 等带命名空间前缀，按本地名后缀匹配
                     if name_str == "meta" || name_str.ends_with(":meta") {
                         pending_meta_name.clear();
+                        // 属性式 <meta name="..." content="...">（含 Start 形式，calibre 全系
+                        // `<meta name="cover" content="<id>"/>` 在此命中）；text 体式极罕见，不展开
+                        let mut content = String::new();
                         for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"name" {
-                                pending_meta_name = String::from_utf8_lossy(&attr.value).into_owned();
+                            match attr.key.as_ref() {
+                                b"name" => pending_meta_name = String::from_utf8_lossy(&attr.value).into_owned(),
+                                b"content" => content = String::from_utf8_lossy(&attr.value).into_owned(),
+                                _ => {}
                             }
+                        }
+                        if !pending_meta_name.is_empty() && !content.is_empty() {
+                            let name = pending_meta_name.clone();
+                            apply_meta(&mut opf, &name, &content);
                         }
                     } else {
                         for (suffix, target) in [
@@ -234,11 +239,23 @@ fn parse_opf(xml: &str) -> Opf {
         }
         buf.clear();
     }
+    // 三源合并后的 meta cover 解析：meta（EPUB 2）在 manifest 之前声明，
+    // 这里按 id（规范）或 href（容错）定位封面 item（空串视为未设置）
+    if opf.cover_item_id.as_deref().unwrap_or("").is_empty() {
+        if let Some(r) = &opf.meta_cover_ref {
+            if let Some(item) = opf.manifest.iter().find(|i| &i.id == r || i.href == *r) {
+                opf.cover_item_id = Some(item.id.clone());
+            }
+        }
+    }
     opf
 }
 
 fn apply_meta(opf: &mut Opf, name: &str, content: &str) {
-    if name == "calibre:series" {
+    if name == "cover" {
+        // EPUB 2：content 指向 manifest item 的 id（个别制作器直接放 href，匹配时两者都试）
+        opf.meta_cover_ref = Some(content.to_string());
+    } else if name == "calibre:series" {
         opf.metadata.series = content.to_string();
     } else if name == "calibre:series_index" {
         opf.metadata.series_index = content.parse().unwrap_or(0.0);
@@ -377,6 +394,59 @@ fn parse_nav(xml: &str, nav_path: &str) -> Vec<TocEntry> {
     build(&flat, &mut idx, 0)
 }
 
+/// spine 首文档首图提取：读首个 spine 文档（封面页），取第一个 image 引用
+/// （SVG 封面页的 `xlink:href` / 普通封面页的 `src`），返回图片字节
+fn cover_from_spine_head(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    opf: &Opf,
+    opf_dir: &str,
+) -> Option<Vec<u8>> {
+    let first_idref = opf.spine.first()?;
+    let item = opf.manifest.iter().find(|i| &i.id == first_idref)?;
+    let doc_href = join_href(opf_dir, &item.href);
+    let mut xml = String::new();
+    {
+        let mut file = archive.by_name(&doc_href).ok()?;
+        file.read_to_string(&mut xml).ok()?;
+    }
+    let doc_dir = match doc_href.rfind('/') {
+        Some(i) => &doc_href[..i],
+        None => "",
+    };
+    // 首图提取：只认 <image>（SVG 封面页，EPUB 3 推荐形态）与 <img> 标签内的引用，
+    // 不能裸搜 src=——head 的 <script src>/​<link href> 会抢先命中
+    let mut image_ref: Option<String> = None;
+    'outer: for tag in ["image", "img"] {
+        let needle = format!("<{tag}");
+        let mut search_from = 0usize;
+        while let Some(rel) = xml[search_from..].find(&needle) {
+            let start = search_from + rel;
+            let end = xml[start..].find('>').map(|i| start + i).unwrap_or(xml.len());
+            let seg = &xml[start..end];
+            for attr in ["xlink:href", "href", "src"] {
+                let a = format!("{attr}=");
+                if let Some(pos) = seg.find(&a) {
+                    let rest = &seg[pos + a.len()..];
+                    let quote = rest.chars().next().unwrap_or('"');
+                    if (quote == '"' || quote == '\'') && rest.len() > 1 {
+                        if let Some(e) = rest[1..].find(quote) {
+                            image_ref = Some(rest[1..1 + e].to_string());
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            search_from = end;
+        }
+    }
+    let image_ref = image_ref?;
+    let image_href = join_href(doc_dir, &image_ref);
+    let mut file = archive.by_name(&image_href).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
 /// NCX（EPUB2）解析：<navMap><navPoint><navLabel><text> + <content src>
 fn parse_ncx(xml: &str, ncx_path: &str) -> Vec<TocEntry> {
     let ncx_dir = match ncx_path.rfind('/') {
@@ -511,7 +581,8 @@ pub fn parse_epub(name: &str, bytes: &[u8]) -> Option<EpubBook> {
     };
     let opf = parse_opf(&opf_xml);
 
-    // 封面：cover-item（manifest）字节
+    // 封面：cover-item（manifest 三源：EPUB 3 properties / item name 属性 / meta name=cover）字节；
+    // 均未声明时回退 spine 首文档首图（cover.xhtml 的 SVG image / img，EPUB 3 规范推荐的封面页形态）
     let mut cover = None;
     if let Some(cover_id) = &opf.cover_item_id {
         if let Some(item) = opf.manifest.iter().find(|i| &i.id == cover_id) {
@@ -523,6 +594,9 @@ pub fn parse_epub(name: &str, bytes: &[u8]) -> Option<EpubBook> {
                 }
             }
         }
+    }
+    if cover.is_none() {
+        cover = cover_from_spine_head(&mut archive, &opf, &opf_dir);
     }
 
     // 目录：nav（EPUB3）优先，NCX 回退
@@ -677,6 +751,113 @@ mod tests {
         assert_eq!(join_href("OEBPS", "../../x.png"), "x.png");
     }
 
+    /// calibre 形态：EPUB 2 `<meta name="cover" content="<manifest id>">` 声明 + SVG 封面页
+    #[test]
+    fn calibre_meta_cover_and_svg_cover_page() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("mimetype", opts).unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+            let container = r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#;
+            zip.start_file("META-INF/container.xml", opts).unwrap();
+            zip.write_all(container.as_bytes()).unwrap();
+
+            // 封面图与装饰图（首图提取必须命中 meta 声明的那张，而非按文件名序）
+            let cover_bytes: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xAA];
+            zip.start_file("OEBPS/Images/real-cover.jpg", opts).unwrap();
+            zip.write_all(cover_bytes).unwrap();
+            let deco: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xBB];
+            zip.start_file("OEBPS/Images/000.jpg", opts).unwrap();
+            zip.write_all(deco).unwrap();
+
+            // SVG 封面页（EPUB 3 推荐形态；xlink:href 引用相对路径）
+            let cover_page = r#"<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Cover</title></head><body>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<image xlink:href="../Images/real-cover.jpg"/></svg></body></html>"#;
+            zip.start_file("OEBPS/Text/cover.xhtml", opts).unwrap();
+            zip.write_all(cover_page.as_bytes()).unwrap();
+            let ch1 = r#"<?xml version="1.0"?><html><body><p>正文</p></body></html>"#;
+            zip.start_file("OEBPS/Text/ch1.xhtml", opts).unwrap();
+            zip.write_all(ch1.as_bytes()).unwrap();
+
+            let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>魔女之旅 01</dc:title>
+    <dc:creator>白石定規</dc:creator>
+    <meta name="cover" content="xcoverjpg"/>
+    <meta name="calibre:series" content="魔女之旅"/>
+    <meta name="calibre:series_index" content="1"/>
+  </metadata>
+  <manifest>
+    <item id="coverpage" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch1" href="Text/ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="xcoverjpg" href="Images/real-cover.jpg" media-type="image/jpeg"/>
+    <item id="img000" href="Images/000.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine><itemref idref="coverpage"/><itemref idref="ch1"/></spine>
+</package>"#;
+            zip.start_file("OEBPS/content.opf", opts).unwrap();
+            zip.write_all(opf.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        let bytes = buf.into_inner();
+        let epub = parse_epub("魔女之旅 01", &bytes).expect("解析失败");
+        // meta name=cover 命中 manifest id → 取到声明的封面（而非其他图片）
+        assert_eq!(&epub.book.cover.unwrap()[..9], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xAA]);
+        assert_eq!(epub.book.title, "魔女之旅 01");
+        assert_eq!(epub.book.series, "魔女之旅");
+        assert_eq!(epub.book.series_index, 1.0);
+    }
+
+    /// 无任何 cover 声明时：spine 首文档（封面页）的首图兜底
+    #[test]
+    fn cover_fallback_to_spine_head_image() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("mimetype", opts).unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+            let container = r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#;
+            zip.start_file("META-INF/container.xml", opts).unwrap();
+            zip.write_all(container.as_bytes()).unwrap();
+            let img: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xCC];
+            zip.start_file("OEBPS/img/cv.png", opts).unwrap();
+            zip.write_all(img).unwrap();
+            // 封面页在子目录（真实 epub 结构），相对引用 ../img/cv.png → 归约为 OEBPS/img/cv.png
+            let cover_page = r#"<?xml version="1.0"?><html><body><div><img src="../img/cv.png"/></div></body></html>"#;
+            zip.start_file("OEBPS/Text/cover.xhtml", opts).unwrap();
+            zip.write_all(cover_page.as_bytes()).unwrap();
+            let ch1 = r#"<?xml version="1.0"?><html><body><p>正文</p></body></html>"#;
+            zip.start_file("OEBPS/ch1.xhtml", opts).unwrap();
+            zip.write_all(ch1.as_bytes()).unwrap();
+            let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>无声明封面</dc:title></metadata>
+  <manifest>
+    <item id="cp" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="cp"/><itemref idref="c1"/></spine>
+</package>"#;
+            zip.start_file("OEBPS/content.opf", opts).unwrap();
+            zip.write_all(opf.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        let epub = parse_epub("无声明封面", &buf.into_inner()).expect("解析失败");
+        assert_eq!(&epub.book.cover.unwrap()[..9], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xCC]);
+    }
+
     #[test]
     fn full_epub_parse() {
         let bytes = build_epub();
@@ -714,3 +895,4 @@ mod tests {
         assert!(!text.contains("var x"));
     }
 }
+
