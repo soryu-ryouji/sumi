@@ -1,13 +1,13 @@
 <script setup lang="ts">
-// 回收站：in_trash 视图 + 恢复 + 清空（不可恢复操作有确认）。
-import { onMounted, ref } from 'vue';
+// 回收站列表：内嵌主界面内容区（由侧栏「回收站」导航置 books.filter.inTrash 后渲染，非独立视图）。
+// 顶部工具行提供计数与清空（不可恢复操作有确认）；单本恢复走行内按钮。
+import { ref } from 'vue';
 import { useBooks } from '@/stores/books';
 import { useUi } from '@/stores/ui';
 import { useLibrary } from '@/stores/library';
 import { useConnection } from '@/stores/connection';
 import { api, directUrl } from '@/shared/api/client';
 import { formatTime } from '@/shared/format';
-import DragBar from '@/app/chrome/DragBar.vue';
 import type { Item } from '@/shared/api/types';
 
 const books = useBooks();
@@ -15,18 +15,6 @@ const ui = useUi();
 const library = useLibrary();
 const conn = useConnection();
 const clearing = ref(false);
-
-onMounted(() => {
-  books.filter.inTrash = true;
-  void books.load().catch(() => {});
-});
-
-function back(): void {
-  books.filter.inTrash = false;
-  ui.view = 'library';
-  void books.load();
-  library.refreshAll().catch(() => {});
-}
 
 async function restore(item: Item): Promise<void> {
   try {
@@ -58,12 +46,12 @@ async function clearAll(): Promise<void> {
 
 <template>
   <div class="trash-view">
-    <DragBar title="回收站">
+    <!-- 内嵌工具行（非拖拽区）：返回书库靠侧栏导航（「全部书籍」/任意筛选退出回收站） -->
+    <div class="trash-toolbar">
       <span class="trash-count">共 {{ books.total }} 本</span>
       <div class="spacer" />
       <button v-if="conn.writable && books.total > 0" class="btn danger" :disabled="clearing" @click="clearAll">清空回收站</button>
-      <button class="btn" @click="back">← 返回书库</button>
-    </DragBar>
+    </div>
     <div class="trash-list">
       <div v-for="item in books.items" :key="item.id" class="trash-item">
         <img class="trash-cover" :src="directUrl('/item/cover', { id: item.id })" :alt="item.title" loading="lazy" />
@@ -85,6 +73,14 @@ async function clearAll(): Promise<void> {
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+.trash-toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
 }
 .trash-count {
   color: var(--muted);

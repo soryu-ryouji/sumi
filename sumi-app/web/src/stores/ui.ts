@@ -1,7 +1,6 @@
-// 界面状态：视图切换、选中项、轻提示。
+// 界面状态：选中项、面板显隐/区块偏好、轻提示。
+// 回收站不是独立视图：内容区切换由 books.filter.inTrash 驱动（侧栏导航/筛选负责置位）。
 import { defineStore } from 'pinia';
-
-export type ViewName = 'library' | 'trash';
 
 /** 侧栏/详情面板的显隐偏好（localStorage 持久化；详情默认隐藏，点击书籍不弹出、由顶栏开关控制） */
 const PANELS_KEY = 'sumi.panels';
@@ -27,6 +26,39 @@ function writePanels(sidebar: boolean, inspector: boolean): void {
   }
 }
 
+/** 侧栏区块偏好（localStorage 持久化）：collapsed 折叠态 / sections 显隐。 */
+const SIDEBAR_KEY = 'sumi.sidebar';
+
+type SidebarPrefs = { collapsed: Record<string, boolean>; sections: Record<string, boolean> };
+
+/** 可配置显隐的区块 key（顺序即设置面板展示顺序；「书库」导航块固定显示，不在其列） */
+const SIDEBAR_SECTION_KEYS = ['folders', 'category', 'tag', 'author', 'series'] as const;
+
+function readSidebarPrefs(): SidebarPrefs {
+  try {
+    const raw = localStorage.getItem(SIDEBAR_KEY);
+    if (raw) {
+      const v = JSON.parse(raw) as Partial<SidebarPrefs>;
+      return {
+        collapsed: v.collapsed && typeof v.collapsed === 'object' ? v.collapsed : {},
+        // 缺失/损坏的 key 一律视为显示（默认展开全显）
+        sections: Object.fromEntries(SIDEBAR_SECTION_KEYS.map((k) => [k, v.sections?.[k] !== false])),
+      };
+    }
+  } catch {
+    // 损坏回退默认
+  }
+  return { collapsed: {}, sections: Object.fromEntries(SIDEBAR_SECTION_KEYS.map((k) => [k, true])) };
+}
+
+function writeSidebarPrefs(collapsed: Record<string, boolean>, sections: Record<string, boolean>): void {
+  try {
+    localStorage.setItem(SIDEBAR_KEY, JSON.stringify({ collapsed, sections }));
+  } catch {
+    // 存储不可用（隐私模式等）时仅保持会话内状态
+  }
+}
+
 export interface Toast {
   id: number;
   text: string;
@@ -35,7 +67,6 @@ export interface Toast {
 
 export const useUi = defineStore('ui', {
   state: () => ({
-    view: 'library' as ViewName,
     /** 详情侧板选中的 item id */
     selectedId: null as string | null,
     /** 详情侧板直接进编辑态（上下文菜单「编辑元数据」置位，Inspector 消费后复位） */
@@ -44,15 +75,29 @@ export const useUi = defineStore('ui', {
     showSidebar: readPanels().sidebar,
     /** 右侧详情面板显隐（顶栏开关，持久化；点击书籍只选中不弹出） */
     showInspector: readPanels().inspector,
+    /** 侧栏各区块折叠态（点击区块标题行切换；缺 key = 展开） */
+    sidebarCollapsed: readSidebarPrefs().collapsed,
+    /** 侧栏区块显隐（设置界面勾选；「书库」导航块固定显示不可配置） */
+    sidebarSections: readSidebarPrefs().sections,
     /** 设置浮动对话框显隐（顶栏开关；设置不再是路由视图，书库界面保留在背景） */
     settingsOpen: false,
-    settingsTab: 'library' as 'library' | 'openers' | 'scan' | 'lan' | 'cache' | 'locks' | 'update' | 'about',
+    settingsTab: 'interface' as 'interface' | 'library' | 'openers' | 'scan' | 'lan' | 'cache' | 'locks' | 'update' | 'about',
     toasts: [] as Toast[],
   }),
   actions: {
     toggleSidebar() {
       this.showSidebar = !this.showSidebar;
       writePanels(this.showSidebar, this.showInspector);
+    },
+    /** 折叠/展开侧栏区块（点击区块标题行） */
+    toggleSidebarSection(key: string) {
+      this.sidebarCollapsed[key] = !this.sidebarCollapsed[key];
+      writeSidebarPrefs(this.sidebarCollapsed, this.sidebarSections);
+    },
+    /** 设置侧栏区块显隐（设置界面勾选） */
+    setSidebarSectionVisible(key: string, visible: boolean) {
+      this.sidebarSections[key] = visible;
+      writeSidebarPrefs(this.sidebarCollapsed, this.sidebarSections);
     },
     toggleInspector() {
       this.showInspector = !this.showInspector;

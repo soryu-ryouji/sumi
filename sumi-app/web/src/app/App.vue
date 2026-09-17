@@ -13,7 +13,6 @@ import StartingScreen from './screens/StartingScreen.vue';
 import WindowControls from './chrome/WindowControls.vue';
 import ContextMenuHost from './chrome/ContextMenuHost.vue';
 import MainView from '@/views/MainView.vue';
-import TrashView from '@/views/TrashView.vue';
 import SettingsView from '@/views/SettingsView.vue';
 import { useUi } from '@/stores/ui';
 
@@ -84,8 +83,7 @@ function quitApp(): void {
       <ConnectScreen v-if="screen === 'connect'" />
       <StartingScreen v-else-if="screen === 'starting'" />
       <template v-else>
-        <TrashView v-if="ui.view === 'trash'" />
-        <MainView v-else />
+        <MainView />
       </template>
     </template>
     <!-- app-region 按 DOM 序合成：后到的 no-drag 才能压住前面视图的 drag 区（TopBar/DragBar 横跨全宽），

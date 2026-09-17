@@ -23,6 +23,7 @@ const library = useLibrary();
 const conn = useConnection();
 
 const TABS = [
+  { key: 'interface', label: '界面' },
   { key: 'library', label: '书库' },
   { key: 'openers', label: '打开方式' },
   { key: 'scan', label: '扫描' },
@@ -31,6 +32,15 @@ const TABS = [
   { key: 'locks', label: '锁' },
   { key: 'update', label: '更新' },
   { key: 'about', label: '关于' },
+] as const;
+
+// ---- 界面：侧栏区块显隐（纯前端偏好，随 ui store 持久化，无服务端交互） ----
+const SIDEBAR_SECTIONS = [
+  { key: 'folders', label: '文件夹' },
+  { key: 'category', label: '分类' },
+  { key: 'tag', label: '标签' },
+  { key: 'author', label: '作者' },
+  { key: 'series', label: '系列' },
 ] as const;
 
 // ---- 书库 ----
@@ -313,8 +323,22 @@ useEventListener(
           </nav>
 
           <div class="settings-panel">
+            <!-- 界面 -->
+            <template v-if="ui.settingsTab === 'interface'">
+              <h3>侧栏区块</h3>
+              <p class="hint">勾选后显示在左侧栏；折叠状态在侧栏内点击区块标题切换。</p>
+              <div v-for="sec in SIDEBAR_SECTIONS" :key="sec.key" class="form-row">
+                <span class="form-label">{{ sec.label }}</span>
+                <input
+                  type="checkbox"
+                  :checked="ui.sidebarSections[sec.key]"
+                  @change="ui.setSidebarSectionVisible(sec.key, ($event.target as HTMLInputElement).checked)"
+                />
+              </div>
+            </template>
+
             <!-- 书库 -->
-            <template v-if="ui.settingsTab === 'library'">
+            <template v-else-if="ui.settingsTab === 'library'">
               <h3>书库信息</h3>
               <div class="form-row"><span class="form-label">书库名</span><input v-model="libName" type="text" :disabled="!conn.writable" /><button v-if="conn.writable" class="btn small" @click="saveName">保存</button></div>
               <div v-if="conn.isAdmin" class="form-row">

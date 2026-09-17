@@ -1,5 +1,6 @@
 <script setup lang="ts">
-// 侧栏：顶部拖拽条（macOS 红绿灯压左端，内容只放右端）+ 文件夹树 + 分类/标签/作者/系列聚合。
+// 侧栏：顶部拖拽条（macOS 红绿灯压左端，内容只放右端）+ 书库导航（全部书籍/回收站，回收站由 books.filter.inTrash 驱动内容区切换）
+// + 文件夹树 + 分类/标签/作者/系列聚合。区块标题行可折叠，显隐可在设置「界面」中配置（偏好持久化在 ui store）。
 import { computed } from 'vue';
 import { useLibrary } from '@/stores/library';
 import { useBooks } from '@/stores/books';
@@ -14,12 +15,14 @@ const books = useBooks();
 const ui = useUi();
 const showBrand = !isMac();
 
-const dimensions = computed(() => [
-  { key: 'category', title: '分类', field: 'categories' as const, entries: library.categories },
-  { key: 'tag', title: '标签', field: 'tags' as const, entries: library.tags },
-  { key: 'author', title: '作者', field: 'authors' as const, entries: library.authors },
-  { key: 'series', title: '系列', field: 'series' as const, entries: library.series },
-]);
+const dimensions = computed(() =>
+  [
+    { key: 'category', title: '分类', field: 'categories' as const, entries: library.categories },
+    { key: 'tag', title: '标签', field: 'tags' as const, entries: library.tags },
+    { key: 'author', title: '作者', field: 'authors' as const, entries: library.authors },
+    { key: 'series', title: '系列', field: 'series' as const, entries: library.series },
+  ].filter((group) => ui.sidebarSections[group.key] !== false),
+);
 
 /** 维度是否已上锁（未解锁的名称在列表服务端仍可见——锁保护的是条目内容与主动筛选） */
 function isLocked(field: string, name: string): boolean {
@@ -33,27 +36,38 @@ function isLocked(field: string, name: string): boolean {
 }
 
 function toggleArrayFilter(field: 'tags' | 'categories' | 'authors', name: string): void {
+  // 点任何筛选都退出回收站（回收站只是 inTrash 筛选态，非独立视图）
+  books.filter.inTrash = false;
   const list = books.filter[field];
   books.filter[field] = list.includes(name) ? list.filter((x) => x !== name) : [...list, name];
   void books.load();
 }
 
 function selectFolder(path: string): void {
+  books.filter.inTrash = false;
   books.filter.folder = books.filter.folder === path ? null : path;
   void books.load();
 }
 
 function selectSeries(name: string): void {
+  books.filter.inTrash = false;
   books.filter.series = books.filter.series === name ? null : name;
   void books.load();
 }
 
 function clearAllFilters(): void {
+  books.filter.inTrash = false;
   books.filter.folder = null;
   books.filter.series = null;
   books.filter.tags = [];
   books.filter.categories = [];
   books.filter.authors = [];
+  void books.load();
+}
+
+/** 进入回收站（内容区随 inTrash 切换为回收站列表） */
+function enterTrash(): void {
+  books.filter.inTrash = true;
   void books.load();
 }
 
@@ -84,31 +98,46 @@ const entryCount = (e: CountEntry) => e.count;
       <button v-if="hasShell()" class="head-btn" title="切换书库" @click="shell()?.selectLibrary()" @dblclick.stop>⇄</button>
     </div>
     <div class="sidebar-scroll">
+      <!-- 书库导航块：固定显示不可配置；标题行可折叠 -->
       <div class="sidebar-section">
-        <div class="sidebar-head"><span class="sidebar-title">{{ library.libraryName || '书库' }}</span></div>
-        <button class="link-btn" :class="{ active: !books.filter.folder && !books.filter.inTrash }" @click="clearAllFilters">全部书籍</button>
-        <button class="link-btn trash" @click="ui.view = 'trash'">回收站</button>
+        <button class="sidebar-head sec-toggle" @click="ui.toggleSidebarSection('library')">
+          <span class="sec-caret" :class="{ open: !ui.sidebarCollapsed.library }">▸</span>
+          <span class="sidebar-title">{{ library.libraryName || '书库' }}</span>
+        </button>
+        <template v-if="!ui.sidebarCollapsed.library">
+          <button class="link-btn" :class="{ active: !books.filter.folder && !books.filter.inTrash }" @click="clearAllFilters">全部书籍</button>
+          <button class="link-btn trash" :class="{ active: books.filter.inTrash }" @click="enterTrash">回收站</button>
+        </template>
       </div>
 
-      <div v-if="library.tree.length" class="sidebar-section">
-        <div class="sidebar-head"><span class="sidebar-title">文件夹</span></div>
-        <FolderTreeNode v-for="node in library.tree" :key="node.path" :node="node" :active="books.filter.folder" @select="selectFolder" />
+      <div v-if="library.tree.length && ui.sidebarSections.folders" class="sidebar-section">
+        <button class="sidebar-head sec-toggle" @click="ui.toggleSidebarSection('folders')">
+          <span class="sec-caret" :class="{ open: !ui.sidebarCollapsed.folders }">▸</span>
+          <span class="sidebar-title">文件夹</span>
+        </button>
+        <template v-if="!ui.sidebarCollapsed.folders">
+          <FolderTreeNode v-for="node in library.tree" :key="node.path" :node="node" :active="books.filter.folder" @select="selectFolder" />
+        </template>
       </div>
 
       <div v-for="group in dimensions" :key="group.key" class="sidebar-section">
-        <div class="sidebar-head"><span class="sidebar-title">{{ group.title }}</span></div>
-        <button
-          v-for="entry in group.entries"
-          :key="entry.name"
-          class="dim-item"
-          :class="{ active: dimActive(group, entry.name) }"
-          @click="dimClick(group, entry.name)"
-        >
-          <span class="dim-name">{{ entry.name }}</span>
-          <span v-if="group.field !== 'series' && isLocked(group.field, entry.name)" class="dim-lock" title="已锁定（在设置中解锁）">🔒</span>
-          <span class="dim-count">{{ entryCount(entry) }}</span>
+        <button class="sidebar-head sec-toggle" @click="ui.toggleSidebarSection(group.key)">
+          <span class="sec-caret" :class="{ open: !ui.sidebarCollapsed[group.key] }">▸</span>
+          <span class="sidebar-title">{{ group.title }}</span>
         </button>
-        <div v-if="!group.entries.length" class="dim-empty">暂无</div>
+        <template v-if="!ui.sidebarCollapsed[group.key]">
+          <button
+            v-for="entry in group.entries"
+            :key="entry.name"
+            class="dim-item"
+            :class="{ active: dimActive(group, entry.name) }"
+            @click="dimClick(group, entry.name)"
+          >
+            <span class="dim-name">{{ entry.name }}</span>
+            <span v-if="group.field !== 'series' && isLocked(group.field, entry.name)" class="dim-lock" title="已锁定（在设置中解锁）">🔒</span>
+            <span class="dim-count">{{ entryCount(entry) }}</span>
+          </button>
+        </template>
       </div>
     </div>
   </aside>
@@ -171,11 +200,43 @@ const entryCount = (e: CountEntry) => e.count;
 .sidebar-head {
   padding: 0 8px 4px;
 }
+/* 区块标题行：可点击折叠/展开。原生 button 无全局 reset，须自清默认样式；
+   同时退出 .sidebar-head 的窗口拖拽区（drag 会吞掉点击） */
+.sec-toggle {
+  width: 100%;
+  height: auto;
+  padding: 0 4px 4px;
+  border: none;
+  border-bottom: none;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+/* caret 展开态旋转 90°（与文件夹树 tree-caret 同款） */
+.sec-caret {
+  width: 12px;
+  flex: none;
+  color: var(--muted);
+  font-size: 10px;
+  transition: transform 0.12s;
+  text-align: center;
+}
+.sec-caret.open {
+  transform: rotate(90deg);
+}
 .sidebar-title {
   font-size: 11px;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
+}
+/* 区块内容缩进对齐标题文字（标题 = 4 左内边距 + 12 caret + 8 gap = 24px）；
+   文件夹树节点自带 caret 占位已自然对齐，不在此列 */
+.sidebar-section .link-btn,
+.sidebar-section .dim-item {
+  padding-left: 24px;
 }
 .link-btn {
   display: block;
@@ -198,6 +259,10 @@ const entryCount = (e: CountEntry) => e.count;
 }
 .link-btn.trash {
   color: var(--muted);
+}
+/* trash 的 muted 会压过 active 的白字（同优先级后写胜出），补一条恢复高亮 */
+.link-btn.trash.active {
+  color: #fff;
 }
 
 .dim-item {
@@ -237,10 +302,5 @@ const entryCount = (e: CountEntry) => e.count;
 }
 .dim-lock {
   font-size: 11px;
-}
-.dim-empty {
-  padding: 4px 8px;
-  font-size: 12px;
-  color: var(--muted);
 }
 </style>

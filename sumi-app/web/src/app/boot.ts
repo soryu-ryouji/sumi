@@ -34,7 +34,7 @@ export async function onServerReady(address: string, token: string): Promise<voi
   await conn.connect(address, token);
   history.replaceState(null, '', `#api=${encodeURIComponent(address)}&token=${token}`);
   // 初始数据并行拉取（失败不阻断界面，列表自身会呈现错误态）
-  await Promise.allSettled([library.refreshAll(), books.filter.inTrash ? books.load() : books.load()]);
+  await Promise.allSettled([library.refreshAll(), books.load()]);
   subscribeServerEvents();
 }
 
@@ -77,6 +77,10 @@ function subscribeServerEvents(): void {
       },
       'item.trashed': (p) => {
         books.dropItem((p as { id: string }).id);
+        // 回收站态下新移入的条目需刷新列表（与 item.restored 对称）
+        if (books.filter.inTrash) {
+          books.load().catch(() => {});
+        }
         library.refreshAll().catch(() => {});
       },
       'item.restored': () => {
