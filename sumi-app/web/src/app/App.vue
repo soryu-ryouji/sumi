@@ -59,7 +59,6 @@ function quitApp(): void {
 
 <template>
   <div class="app-root">
-    <WindowControls />
     <div v-if="serverError" class="fatal-error">
       <div class="fatal-card">
         <h2>后端服务异常</h2>
@@ -74,12 +73,17 @@ function quitApp(): void {
       <ConnectScreen v-if="screen === 'connect'" />
       <StartingScreen v-else-if="screen === 'starting'" />
       <template v-else>
-        <SettingsView v-if="ui.view === 'settings'" />
-        <TrashView v-else-if="ui.view === 'trash'" />
+        <TrashView v-if="ui.view === 'trash'" />
         <MainView v-else />
       </template>
     </template>
+    <!-- app-region 按 DOM 序合成：后到的 no-drag 才能压住前面视图的 drag 区（TopBar/DragBar 横跨全宽），
+         故本组件必须排在各视图之后，否则窗口控制三钮被覆盖成拖拽区、点击失效 -->
+    <WindowControls />
     <ContextMenuHost />
+    <!-- 设置浮动对话框：组件自身 Teleport 到 body，挂载位置仅作语义占位；
+         遮罩 z-index 低于窗口控制（500），打开期间右上三钮仍可点击 -->
+    <SettingsView v-if="ui.settingsOpen" />
     <div class="toast-wrap">
       <div v-for="t in ui.toasts" :key="t.id" class="toast" :class="t.kind">{{ t.text }}</div>
     </div>

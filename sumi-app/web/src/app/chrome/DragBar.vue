@@ -6,8 +6,9 @@ import { hasShell, isMac, TRAFFIC_INSET, CONTROLS_INSET, dragDoubleclickMaximize
 
 defineProps<{ title?: string }>();
 
-const padLeft = hasShell() && isMac() ? `${TRAFFIC_INSET}px` : '0px';
-const padRight = hasShell() && !isMac() ? `${CONTROLS_INSET}px` : '0px';
+// 无需避让的一侧不要给内联 padding：内联 0px 会覆盖 CSS 的 padding: 0 12px，标题/内容贴边
+const padLeft = hasShell() && isMac() ? `${TRAFFIC_INSET}px` : undefined;
+const padRight = hasShell() && !isMac() ? `${CONTROLS_INSET}px` : undefined;
 </script>
 
 <template>

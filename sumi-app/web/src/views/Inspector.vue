@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// 详情侧板：元数据展示/编辑（update）、路径操作、封面管理、移入回收站。
-// viewer 只读时仅展示。
+// 详情侧板：选中书籍时展示/编辑元数据（update）、路径操作、封面管理、移入回收站（viewer 只读时仅展示）；
+// 未选中书籍时显示当前分区概览（文件夹分区 → 文件夹信息，其余 → 书库整体信息）。
 import { computed, reactive, ref, watch } from 'vue';
 import { useUi } from '@/stores/ui';
 import { useBooks } from '@/stores/books';
@@ -9,7 +9,7 @@ import { useLibrary } from '@/stores/library';
 import { api, directUrl } from '@/shared/api/client';
 import { formatBytes, formatTime, READ_STATUS_LABEL } from '@/shared/format';
 import { shell } from '@/app/shell';
-import type { Item } from '@/shared/api/types';
+import type { FolderNode, Item } from '@/shared/api/types';
 
 const ui = useUi();
 const books = useBooks();
@@ -18,6 +18,43 @@ const library = useLibrary();
 
 const item = computed<Item | null>(() => books.items.find((i) => i.id === ui.selectedId) ?? null);
 const show = computed(() => item.value !== null);
+
+// 分区概览：在文件夹树中递归定位当前筛选的文件夹（找不到时名称回退为路径最后一段）
+function findFolderNode(nodes: FolderNode[], path: string): FolderNode | null {
+  for (const n of nodes) {
+    if (n.path === path) {
+      return n;
+    }
+    const hit = findFolderNode(n.children, path);
+    if (hit) {
+      return hit;
+    }
+  }
+  return null;
+}
+
+const folderNode = computed<FolderNode | null>(() => {
+  const p = books.filter.folder;
+  return p ? findFolderNode(library.tree, p) : null;
+});
+
+const folderName = computed(() => {
+  if (folderNode.value) {
+    return folderNode.value.name;
+  }
+  return books.filter.folder?.split(/[\\/]/).filter(Boolean).pop() ?? '';
+});
+
+// 概览的「当前筛选」chips（系列 + 分类/标签/作者；key 加维度前缀避免同名值 key 重复）
+const activeFilters = computed<{ key: string; label: string }[]>(() => {
+  const f = books.filter;
+  return [
+    ...(f.series ? [{ key: `s:${f.series}`, label: f.series }] : []),
+    ...f.categories.map((v) => ({ key: `c:${v}`, label: v })),
+    ...f.tags.map((v) => ({ key: `t:${v}`, label: v })),
+    ...f.authors.map((v) => ({ key: `a:${v}`, label: v })),
+  ];
+});
 
 // 编辑态：从 item 快照构建表单
 const editing = ref(false);
@@ -167,8 +204,9 @@ async function removeCover(): Promise<void> {
 </script>
 
 <template>
-  <aside v-if="show && item" class="inspector">
-    <div class="inspector-scroll">
+  <aside v-if="ui.showInspector" class="inspector">
+    <!-- 选中书籍：元数据展示/编辑 -->
+    <div v-if="show && item" class="inspector-scroll">
       <div class="inspector-cover">
         <img :src="directUrl('/item/cover', { id: item.id })" :alt="item.title" />
         <div v-if="conn.writable" class="cover-actions">
@@ -240,6 +278,37 @@ async function removeCover(): Promise<void> {
           <button class="path-btn" title="复制路径" @click="copyPath(p)">⧉</button>
         </div>
       </div>
+    </div>
+
+    <!-- 未选中书籍：当前分区概览 -->
+    <div v-else class="inspector-scroll">
+      <template v-if="books.filter.folder">
+        <div class="paths-title">文件夹</div>
+        <h2 class="i-title">{{ folderName }}</h2>
+        <div class="i-meta">
+          <div class="meta-row"><span>路径</span><b :title="books.filter.folder">{{ books.filter.folder }}</b></div>
+          <div class="meta-row"><span>书籍</span><b>{{ books.total }} 本 · {{ formatBytes(books.totalSize) }}</b></div>
+          <div v-if="folderNode" class="meta-row"><span>修改</span><b>{{ formatTime(folderNode.modification_time) }}</b></div>
+          <div v-if="folderNode" class="meta-row"><span>子文件夹</span><b>{{ folderNode.children.length }}</b></div>
+        </div>
+      </template>
+      <template v-else>
+        <div class="paths-title">书库</div>
+        <h2 class="i-title">{{ library.libraryName || '书库' }}</h2>
+        <div class="i-meta">
+          <div class="meta-row"><span>书籍</span><b>{{ books.total }} 本 · {{ formatBytes(books.totalSize) }}</b></div>
+          <div class="meta-row"><span>分类</span><b>{{ library.categories.length }}</b></div>
+          <div class="meta-row"><span>标签</span><b>{{ library.tags.length }}</b></div>
+          <div class="meta-row"><span>作者</span><b>{{ library.authors.length }}</b></div>
+          <div class="meta-row"><span>系列</span><b>{{ library.series.length }}</b></div>
+        </div>
+      </template>
+      <template v-if="activeFilters.length">
+        <div class="paths-title">当前筛选</div>
+        <div class="i-chips">
+          <span v-for="f in activeFilters" :key="f.key" class="chip">{{ f.label }}</span>
+        </div>
+      </template>
     </div>
   </aside>
 </template>

@@ -45,7 +45,7 @@ function errorText(e: unknown): string {
     </div>
     <div v-else-if="!books.loading && !books.items.length" class="grid-state">
       <div class="grid-empty-title">{{ library.libraryName || '书库' }} 还是空的</div>
-      <div class="grid-empty-sub">把书籍文件拖进窗口，或点击右上角「添加书籍」</div>
+      <div class="grid-empty-sub">把书籍文件拖进窗口即可导入</div>
     </div>
     <div v-else class="book-grid">
       <BookCard v-for="item in books.items" :key="item.id" :item="item" />

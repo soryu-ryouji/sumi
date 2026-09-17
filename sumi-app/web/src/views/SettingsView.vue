@@ -1,13 +1,18 @@
 <script setup lang="ts">
-// 设置面板：书库（改名/存储模式/扫描）、LAN、缓存目录、锁管理、关于。
-// 只读 viewer 仅可浏览（写操作按钮隐藏）。
-import { computed, onMounted, reactive, ref, type Ref } from 'vue';
+// 设置面板：浮动对话框（Teleport 到 body 遮罩居中，书库界面保留在背景），
+// 书库（改名/存储模式/扫描）、LAN、缓存目录、锁管理、关于。只读 viewer 仅可浏览（写操作按钮隐藏）。
+// 交互要点（参考 hawk SettingsDialog）：
+// - 遮罩「按下与抬起都落在遮罩上」才关闭：面板内拖选文本滑出松开不误关。
+// - Esc 关闭（捕获阶段拦截并阻断冒泡，避免顶栏搜索等全局 Esc 处理跟着触发）。
+// - 打开期间挂 body.dialog-open 挂起窗口拖拽区（styles.css 全局降为 no-drag）：Electron 的
+//   -webkit-app-region: drag 由 OS 命中测试优先消费，不禁用的话点遮罩盖住的顶栏会变成拖动窗口。
+import { computed, onMounted, onUnmounted, reactive, ref, type Ref } from 'vue';
+import { useEventListener } from '@vueuse/core';
 import { useUi } from '@/stores/ui';
 import { useLibrary } from '@/stores/library';
 import { useConnection } from '@/stores/connection';
 import { api } from '@/shared/api/client';
 import { shell } from '@/app/shell';
-import DragBar from '@/app/chrome/DragBar.vue';
 import type { DimensionNames, LanConfig } from '@/shared/api/types';
 
 const ui = useUi();
@@ -16,6 +21,7 @@ const conn = useConnection();
 
 const TABS = [
   { key: 'library', label: '书库' },
+  { key: 'openers', label: '打开方式' },
   { key: 'scan', label: '扫描' },
   { key: 'lan', label: '局域网' },
   { key: 'cache', label: '缓存' },
@@ -218,150 +224,239 @@ const lockEntries = computed(() => {
   }
   return (['folders', 'categories', 'tags', 'authors'] as const).flatMap((key) => l[key].map((name) => ({ dim: key, name })));
 });
+
+// ---- 浮动对话框生命周期 ----
+onMounted(() => {
+  document.body.classList.add('dialog-open');
+});
+onUnmounted(() => {
+  document.body.classList.remove('dialog-open');
+});
+
+// 遮罩关闭：按下与抬起都落在遮罩上才关（面板内拖选文本滑出松开不误关）
+let downOnMask = false;
+
+function onMaskDown(e: PointerEvent): void {
+  downOnMask = e.target === e.currentTarget;
+}
+
+function onMaskUp(e: PointerEvent): void {
+  if (downOnMask && e.target === e.currentTarget) {
+    ui.settingsOpen = false;
+  }
+  downOnMask = false;
+}
+
+// Esc 关闭：捕获阶段处理并阻断冒泡，避免顶栏搜索等全局 Esc 处理跟着触发
+useEventListener(
+  window,
+  'keydown',
+  (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      ui.settingsOpen = false;
+    }
+  },
+  { capture: true },
+);
 </script>
 
 <template>
-  <div class="settings">
-    <DragBar title="设置" />
-    <div class="settings-body">
-      <nav class="settings-nav">
-        <button v-for="tab in TABS" :key="tab.key" class="nav-item" :class="{ active: ui.settingsTab === tab.key }" @click="ui.settingsTab = tab.key; ui.view = 'settings'">
-          {{ tab.label }}
-        </button>
-        <button class="nav-item back" @click="ui.view = 'library'">← 返回书库</button>
-      </nav>
+  <Teleport to="body">
+    <div class="mask" @pointerdown="onMaskDown" @pointerup="onMaskUp">
+      <div class="dialog" role="dialog" aria-modal="true" aria-label="设置">
+        <header class="dialog-head">
+          <span class="dialog-title">设置</span>
+          <button class="dialog-close" title="关闭 (Esc)" @click="ui.settingsOpen = false">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <path d="M18 6L6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </header>
 
-      <div class="settings-panel">
-        <!-- 书库 -->
-        <template v-if="ui.settingsTab === 'library'">
-          <h3>书库信息</h3>
-          <div class="form-row"><span class="form-label">书库名</span><input v-model="libName" type="text" :disabled="!conn.writable" /><button v-if="conn.writable" class="btn small" @click="saveName">保存</button></div>
-          <div v-if="conn.isAdmin" class="form-row">
-            <span class="form-label">元数据存储</span>
-            <select :value="storageMode" :disabled="switching" @change="switchStorage(($event.target as HTMLSelectElement).value)">
-              <option value="database">数据库（本地专用，性能好）</option>
-              <option value="toml">配置文件（网盘同步友好）</option>
-            </select>
+        <div class="settings-body">
+          <nav class="settings-nav">
+            <button v-for="tab in TABS" :key="tab.key" class="nav-item" :class="{ active: ui.settingsTab === tab.key }" @click="ui.settingsTab = tab.key">
+              {{ tab.label }}
+            </button>
+          </nav>
+
+          <div class="settings-panel">
+            <!-- 书库 -->
+            <template v-if="ui.settingsTab === 'library'">
+              <h3>书库信息</h3>
+              <div class="form-row"><span class="form-label">书库名</span><input v-model="libName" type="text" :disabled="!conn.writable" /><button v-if="conn.writable" class="btn small" @click="saveName">保存</button></div>
+              <div v-if="conn.isAdmin" class="form-row">
+                <span class="form-label">元数据存储</span>
+                <select :value="storageMode" :disabled="switching" @change="switchStorage(($event.target as HTMLSelectElement).value)">
+                  <option value="database">数据库（本地专用，性能好）</option>
+                  <option value="toml">配置文件（网盘同步友好）</option>
+                </select>
+              </div>
+            </template>
+
+            <!-- 打开方式 -->
+            <template v-else-if="ui.settingsTab === 'openers'">
+              <h3>打开方式</h3>
+              <p class="hint">按格式指定打开书籍的应用（未指定 = 系统默认应用）。
+              macOS 支持 .app 路径 / 应用名 / 可执行文件路径；Windows/Linux 填可执行文件路径。</p>
+              <div v-for="ext in OPEN_EXTS" :key="ext" class="form-row">
+                <span class="form-label">.{{ ext }}</span>
+                <input v-model="openers[ext]" type="text" placeholder="系统默认" :disabled="!conn.writable" class="opener-input" />
+                <button v-if="shell() && conn.writable" class="btn small" @click="pickOpener(ext)">选择…</button>
+                <button v-if="conn.writable && openers[ext]" class="btn small" @click="openers[ext] = ''">清除</button>
+              </div>
+              <button v-if="conn.writable" class="btn" :disabled="openersSaving" @click="saveOpeners">保存</button>
+            </template>
+
+            <!-- 扫描 -->
+            <template v-else-if="ui.settingsTab === 'scan'">
+              <h3>周期扫描</h3>
+              <p class="hint">文件监听漏事件时的兜底：周期性重扫书库收敛索引（默认 15 分钟）。</p>
+              <div class="form-row"><span class="form-label">启用</span><input v-model="scan.periodic" type="checkbox" :disabled="!conn.writable" /></div>
+              <div class="form-row"><span class="form-label">间隔（秒）</span><input v-model.number="scan.interval" type="number" min="60" :disabled="!conn.writable" /></div>
+              <button v-if="conn.writable" class="btn" @click="saveScan">保存</button>
+            </template>
+
+            <!-- LAN -->
+            <template v-else-if="ui.settingsTab === 'lan'">
+              <h3>局域网访问</h3>
+              <p v-if="!conn.isAdmin" class="hint">需要管理员权限。</p>
+              <template v-if="lan && conn.isAdmin">
+                <p class="hint">同一书库经浏览器访问（viewer token 鉴权，权限三档）。监听能力随桌面端打包接线。</p>
+                <div class="form-row"><span class="form-label">启用</span><input v-model="lan.enabled" type="checkbox" /></div>
+                <div class="form-row"><span class="form-label">端口</span><input v-model.number="lan.port" type="number" min="1" max="65535" /></div>
+                <div class="form-row"><span class="form-label">viewer token</span><input v-model="lan.token" type="text" /></div>
+                <div class="form-row"><span class="form-label">允许写</span><input v-model="lan.writable" type="checkbox" /></div>
+                <div class="form-row"><span class="form-label">拆分写 token</span><input v-model="lan.separate_write_token" type="checkbox" /></div>
+                <div v-if="lan.separate_write_token" class="form-row"><span class="form-label">write token</span><input v-model="lan.write_token" type="text" /></div>
+                <button class="btn" @click="saveLan">保存</button>
+                <div v-if="lanUrls" class="lan-addr">本机地址：{{ lanUrls }}</div>
+              </template>
+            </template>
+
+            <!-- 缓存 -->
+            <template v-else-if="ui.settingsTab === 'cache'">
+              <h3>缓存目录</h3>
+              <p class="hint">派生缓存（自动封面 / 全文索引 / 归一化正文）存放位置，可随时删除、重启自动重建，不参与同步。切换后服务重启。</p>
+              <div class="form-row"><span class="form-label">当前位置</span><code class="cache-path">{{ cache?.current ?? '—' }}</code></div>
+              <button class="btn" @click="pickCache">选择新目录…</button>
+              <button v-if="cache && !cache.isDefault" class="btn" @click="resetCache">恢复默认</button>
+              <div style="height: 8px" />
+              <button v-if="conn.writable" class="btn" :disabled="refreshingCache" @click="refreshCache">重建缺失的封面与全文索引</button>
+              <p class="hint">逐本重建走右键菜单「刷新元数据」；强制全部重建可先删除缓存目录内容再重启。</p>
+            </template>
+
+            <!-- 锁 -->
+            <template v-else-if="ui.settingsTab === 'locks'">
+              <h3>锁</h3>
+              <p class="hint">四维锁（文件夹/分类/标签/作者），服务端强制：未解锁时对应条目从列表与内容直连中排除。</p>
+              <div v-if="lockEntries.length" class="lock-list">
+                <div v-for="entry in lockEntries" :key="entry.dim + entry.name" class="lock-row">
+                  <span class="chip">{{ DIM_LABEL[entry.dim] }}</span>
+                  <span class="lock-name">{{ entry.name }}</span>
+                  <button v-if="conn.isAdmin" class="btn small" @click="removeLock(entry.dim === 'folders' ? 'folder' : entry.dim.slice(0, -1), entry.name)">解除</button>
+                </div>
+              </div>
+              <div v-else class="hint">当前没有上锁的条目。</div>
+
+              <template v-if="conn.isAdmin">
+                <h4>上锁</h4>
+                <div class="form-row">
+                  <select v-model="lockForm.dimension"><option value="folder">文件夹</option><option value="category">分类</option><option value="tag">标签</option><option value="author">作者</option></select>
+                  <input v-model="lockForm.name" type="text" placeholder="名称" />
+                  <input v-model="lockForm.password" type="password" placeholder="密码" />
+                  <button class="btn small" @click="setLock">上锁</button>
+                </div>
+              </template>
+
+              <h4>解锁（本次会话）</h4>
+              <div class="form-row">
+                <select v-model="unlockForm.dimension"><option value="folder">文件夹</option><option value="category">分类</option><option value="tag">标签</option><option value="author">作者</option></select>
+                <input v-model="unlockForm.name" type="text" placeholder="名称" />
+                <input v-model="unlockForm.password" type="password" placeholder="密码" />
+                <button class="btn small" @click="unlock">解锁</button>
+              </div>
+              <p class="hint">已解锁 {{ conn.unlockTickets.length }} 项（票据随服务重启失效）。</p>
+            </template>
+
+            <!-- 关于 -->
+            <template v-else>
+              <div class="about">
+                <img src="/icon.png" alt="sumi" />
+                <h3>sumi</h3>
+                <p>对标 Calibre 的开源书籍/文本资源管理工具</p>
+                <p class="hint">daemon {{ conn.appInfo?.version }} · app 0.1.0 · {{ conn.appInfo?.platform }}</p>
+              </div>
+            </template>
           </div>
-        </template>
-
-        <!-- 打开方式 -->
-        <template v-else-if="ui.settingsTab === 'openers'">
-          <h3>打开方式</h3>
-          <p class="hint">按格式指定打开书籍的应用（未指定 = 系统默认应用）。
-          macOS 支持 .app 路径 / 应用名 / 可执行文件路径；Windows/Linux 填可执行文件路径。</p>
-          <div v-for="ext in OPEN_EXTS" :key="ext" class="form-row">
-            <span class="form-label">.{{ ext }}</span>
-            <input v-model="openers[ext]" type="text" placeholder="系统默认" :disabled="!conn.writable" class="opener-input" />
-            <button v-if="shell() && conn.writable" class="btn small" @click="pickOpener(ext)">选择…</button>
-            <button v-if="conn.writable && openers[ext]" class="btn small" @click="openers[ext] = ''">清除</button>
-          </div>
-          <button v-if="conn.writable" class="btn" :disabled="openersSaving" @click="saveOpeners">保存</button>
-        </template>
-
-        <!-- 扫描 -->
-        <template v-else-if="ui.settingsTab === 'scan'">
-          <h3>周期扫描</h3>
-          <p class="hint">文件监听漏事件时的兜底：周期性重扫书库收敛索引（默认 15 分钟）。</p>
-          <div class="form-row"><span class="form-label">启用</span><input v-model="scan.periodic" type="checkbox" :disabled="!conn.writable" /></div>
-          <div class="form-row"><span class="form-label">间隔（秒）</span><input v-model.number="scan.interval" type="number" min="60" :disabled="!conn.writable" /></div>
-          <button v-if="conn.writable" class="btn" @click="saveScan">保存</button>
-        </template>
-
-        <!-- LAN -->
-        <template v-else-if="ui.settingsTab === 'lan'">
-          <h3>局域网访问</h3>
-          <p v-if="!conn.isAdmin" class="hint">需要管理员权限。</p>
-          <template v-if="lan && conn.isAdmin">
-            <p class="hint">同一书库经浏览器访问（viewer token 鉴权，权限三档）。监听能力随桌面端打包接线。</p>
-            <div class="form-row"><span class="form-label">启用</span><input v-model="lan.enabled" type="checkbox" /></div>
-            <div class="form-row"><span class="form-label">端口</span><input v-model.number="lan.port" type="number" min="1" max="65535" /></div>
-            <div class="form-row"><span class="form-label">viewer token</span><input v-model="lan.token" type="text" /></div>
-            <div class="form-row"><span class="form-label">允许写</span><input v-model="lan.writable" type="checkbox" /></div>
-            <div class="form-row"><span class="form-label">拆分写 token</span><input v-model="lan.separate_write_token" type="checkbox" /></div>
-            <div v-if="lan.separate_write_token" class="form-row"><span class="form-label">write token</span><input v-model="lan.write_token" type="text" /></div>
-            <button class="btn" @click="saveLan">保存</button>
-            <div v-if="lanUrls" class="lan-addr">本机地址：{{ lanUrls }}</div>
-          </template>
-        </template>
-
-        <!-- 缓存 -->
-        <template v-else-if="ui.settingsTab === 'cache'">
-          <h3>缓存目录</h3>
-          <p class="hint">派生缓存（自动封面 / 全文索引 / 归一化正文）存放位置，可随时删除、重启自动重建，不参与同步。切换后服务重启。</p>
-          <div class="form-row"><span class="form-label">当前位置</span><code class="cache-path">{{ cache?.current ?? '—' }}</code></div>
-          <button class="btn" @click="pickCache">选择新目录…</button>
-          <button v-if="cache && !cache.isDefault" class="btn" @click="resetCache">恢复默认</button>
-          <div style="height: 8px" />
-          <button v-if="conn.writable" class="btn" :disabled="refreshingCache" @click="refreshCache">重建缺失的封面与全文索引</button>
-          <p class="hint">逐本重建走右键菜单「刷新元数据」；强制全部重建可先删除缓存目录内容再重启。</p>
-        </template>
-
-        <!-- 锁 -->
-        <template v-else-if="ui.settingsTab === 'locks'">
-          <h3>锁</h3>
-          <p class="hint">四维锁（文件夹/分类/标签/作者），服务端强制：未解锁时对应条目从列表与内容直连中排除。</p>
-          <div v-if="lockEntries.length" class="lock-list">
-            <div v-for="entry in lockEntries" :key="entry.dim + entry.name" class="lock-row">
-              <span class="chip">{{ DIM_LABEL[entry.dim] }}</span>
-              <span class="lock-name">{{ entry.name }}</span>
-              <span class="lock-unlocked" v-if="false" />
-              <button v-if="conn.isAdmin" class="btn small" @click="removeLock(entry.dim === 'folders' ? 'folder' : entry.dim.slice(0, -1), entry.name)">解除</button>
-            </div>
-          </div>
-          <div v-else class="hint">当前没有上锁的条目。</div>
-
-          <template v-if="conn.isAdmin">
-            <h4>上锁</h4>
-            <div class="form-row">
-              <select v-model="lockForm.dimension"><option value="folder">文件夹</option><option value="category">分类</option><option value="tag">标签</option><option value="author">作者</option></select>
-              <input v-model="lockForm.name" type="text" placeholder="名称" />
-              <input v-model="lockForm.password" type="password" placeholder="密码" />
-              <button class="btn small" @click="setLock">上锁</button>
-            </div>
-          </template>
-
-          <h4>解锁（本次会话）</h4>
-          <div class="form-row">
-            <select v-model="unlockForm.dimension"><option value="folder">文件夹</option><option value="category">分类</option><option value="tag">标签</option><option value="author">作者</option></select>
-            <input v-model="unlockForm.name" type="text" placeholder="名称" />
-            <input v-model="unlockForm.password" type="password" placeholder="密码" />
-            <button class="btn small" @click="unlock">解锁</button>
-          </div>
-          <p class="hint">已解锁 {{ conn.unlockTickets.length }} 项（票据随服务重启失效）。</p>
-        </template>
-
-        <!-- 关于 -->
-        <template v-else>
-          <div class="about">
-            <img src="/icon.png" alt="sumi" />
-            <h3>sumi</h3>
-            <p>对标 Calibre 的开源书籍/文本资源管理工具</p>
-            <p class="hint">daemon {{ conn.appInfo?.version }} · app 0.1.0 · {{ conn.appInfo?.platform }}</p>
-          </div>
-        </template>
+        </div>
       </div>
     </div>
-  </div>
+  </Teleport>
 </template>
 
 <style scoped>
-.settings {
-  flex: 1;
+.mask {
+  position: fixed;
+  inset: 0;
+  /* 深于主界面；浅于右键菜单（900），低于窗口控制（500）使右上三钮在对话框打开时仍可点 */
+  z-index: 450;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+/* 对话框尺寸固定（钳制视口）：分区切换/提示出现只改内容区滚动，面板尺寸不变，避免界面跳跃 */
+.dialog {
+  width: min(720px, calc(100vw - 32px));
+  height: min(600px, 88vh);
   display: flex;
   flex-direction: column;
-  min-height: 0;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+.dialog-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 10px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.dialog-title {
+  font-weight: 600;
+}
+/* 头部关闭钮：28px 方形，风格对齐 TopBar 的 icon-btn */
+.dialog-close {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.dialog-close:hover {
+  color: var(--text);
+  background: var(--hover);
 }
 .settings-body {
   flex: 1;
-  display: flex;
   min-height: 0;
+  display: flex;
 }
 .settings-nav {
-  width: 160px;
+  width: 120px;
   flex: none;
   border-right: 1px solid var(--border);
-  background: var(--panel);
   padding: 10px 8px;
   display: flex;
   flex-direction: column;
@@ -384,15 +479,10 @@ const lockEntries = computed(() => {
   background: var(--accent-dim);
   color: #fff;
 }
-.nav-item.back {
-  margin-top: 12px;
-  color: var(--muted);
-}
 .settings-panel {
   flex: 1;
   overflow-y: auto;
   padding: 24px 28px;
-  max-width: 720px;
 }
 h3 {
   margin: 0 0 16px;

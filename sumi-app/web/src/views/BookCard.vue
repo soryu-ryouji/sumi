@@ -89,6 +89,7 @@ function onContextMenu(e: MouseEvent): void {
     items.push({
       label: '编辑元数据',
       action: () => {
+        ui.openInspector(); // 面板隐藏时主动展开（用户明确的查看意图）
         ui.inspectorEdit = true;
       },
     });

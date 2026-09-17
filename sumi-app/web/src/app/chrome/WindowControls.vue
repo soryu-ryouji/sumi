@@ -4,6 +4,7 @@
 // 纯浏览器（无 Electron 壳）无窗口控制，同样不渲染。
 import { onMounted, onUnmounted, ref } from 'vue';
 import { shell } from '@/app/shell';
+import { CONTROLS_HEIGHT } from '@/shared/lib/platform';
 
 const visible = shell() !== null && shell()?.platform !== 'darwin';
 const maximized = ref(false);
@@ -23,7 +24,7 @@ function toggleMaximize(): void {
 </script>
 
 <template>
-  <div v-if="visible" class="win-controls">
+  <div v-if="visible" class="win-controls" :style="{ height: CONTROLS_HEIGHT + 'px' }">
     <button class="win-btn" title="最小化" @click="shell()?.minimizeWindow()">
       <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor" /></svg>
     </button>
@@ -47,7 +48,6 @@ function toggleMaximize(): void {
   right: 0;
   z-index: 500;
   display: flex;
-  height: 38px;
   -webkit-app-region: no-drag;
 }
 .win-btn {

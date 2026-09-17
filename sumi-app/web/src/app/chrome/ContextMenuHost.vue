@@ -51,7 +51,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
         <template v-for="(item, i) in state.items" :key="i">
           <div v-if="item.separator" class="ctx-sep" />
           <button v-else class="ctx-item" :class="{ danger: item.danger }" @click="run(item)">
-            {{ item.label }}
+            <span class="ctx-check">{{ item.checked ? '✓' : '' }}</span>{{ item.label }}
           </button>
         </template>
       </div>
@@ -102,5 +102,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
   height: 1px;
   background: var(--border);
   margin: 4px 8px;
+}
+/* 勾选位：固定宽度保持无勾项同样缩进对齐 */
+.ctx-check {
+  display: inline-block;
+  width: 16px;
+  color: var(--accent);
 }
 </style>

@@ -1,19 +1,37 @@
 <script setup lang="ts">
-// 主界面三栏布局：侧栏（导航/筛选）+ 顶栏（搜索/操作）+ 内容区（网格 + 详情侧板）。
+// 主界面：侧栏（导航/筛选，通高）+ 右半（顶栏通栏 + 内容行：网格 + 详情侧板）。
+// 顶栏通栏覆盖详情侧板上方，窗口控制避让由顶栏统一处理，详情侧板不再自带顶部占位条。
+// 左右侧栏显隐由顶栏开关控制（ui.showSidebar / ui.showInspector，持久化）。
+// 整个主界面为拖拽导入区（拖文件落入即导入）。
+import { useUi } from '@/stores/ui';
+import { importBooks } from '@/shared/lib/importer';
 import Sidebar from './Sidebar.vue';
 import TopBar from './TopBar.vue';
 import BookGrid from './BookGrid.vue';
 import Inspector from './Inspector.vue';
+
+const ui = useUi();
+
+// 主界面整窗拖拽导入
+function onDrop(e: DragEvent): void {
+  const files = Array.from(e.dataTransfer?.files ?? []);
+  if (files.length) {
+    e.preventDefault();
+    importBooks(files);
+  }
+}
 </script>
 
 <template>
-  <div class="main-view">
-    <Sidebar />
-    <div class="main-center">
+  <div class="main-view" @drop="onDrop" @dragover.prevent>
+    <Sidebar v-if="ui.showSidebar" />
+    <div class="main-body">
       <TopBar />
-      <BookGrid />
+      <div class="main-center">
+        <BookGrid />
+        <Inspector />
+      </div>
     </div>
-    <Inspector />
   </div>
 </template>
 
@@ -23,10 +41,15 @@ import Inspector from './Inspector.vue';
   display: flex;
   min-height: 0;
 }
-.main-center {
+.main-body {
   flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
+}
+.main-center {
+  flex: 1;
+  display: flex;
+  min-height: 0;
 }
 </style>

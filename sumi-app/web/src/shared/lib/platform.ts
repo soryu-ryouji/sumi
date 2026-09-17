@@ -13,6 +13,9 @@ export const TRAFFIC_INSET = 80;
 /** 窗口右上角自绘控制避让宽度（Windows/Linux；3 × 44px 按钮） */
 export const CONTROLS_INSET = 136;
 
+/** 窗口右上角自绘控制条高度（Windows/Linux；WindowControls 与内容区顶部避让共用） */
+export const CONTROLS_HEIGHT = 38;
+
 /** 双击拖拽区切换最大化（macOS 惯例；控件上双击不触发由调用方过滤） */
 export function dragDoubleclickMaximize(e: MouseEvent): void {
   if ((e.target as HTMLElement).closest('button, input, select, a')) {
