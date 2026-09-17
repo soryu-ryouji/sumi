@@ -4,7 +4,8 @@
 #[test]
 fn openapi_json_in_sync() {
     let generated = crate::api::build_openapi_json();
-    let committed = include_str!("../../openapi.json");
+    // 换行归一：Windows autocrlf 检出的 CRLF 与生成端 LF 差异不代表契约漂移
+    let committed = include_str!("../../openapi.json").replace("\r\n", "\n");
     assert_eq!(
         generated, committed,
         "openapi.json 与代码不同步：运行 `cargo run -- --dump-openapi > openapi.json` 重新固化"

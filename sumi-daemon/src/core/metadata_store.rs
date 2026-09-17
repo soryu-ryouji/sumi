@@ -359,6 +359,8 @@ impl MetadataStore {
                     toml_meta::write_metadata_file(&path, item)
                         .map_err(|e| format!("迁移写入失败 {path}: {e}"))?;
                 }
+                // 先关 db 连接再删文件：Windows 删除打开中的 SQLite 文件会失败（Unix 允许）
+                *self.db.lock().unwrap() = None;
                 // 删旧 db（WAL/SHM 伴随文件一并）
                 for suffix in ["", "-wal", "-shm"] {
                     let p = format!("{}{suffix}", self.paths.metadata_db_file);

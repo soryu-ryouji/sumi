@@ -9,16 +9,25 @@ BIN="${SUMI_BIN:-target/release/sumi-daemon}"
 LIB="$(mktemp -d /tmp/sumi-smoke.XXXXXX)"
 PORT=$((27400 + RANDOM % 100))
 TOKEN="smoketoken$$"
-cleanup() { kill "$DAEMON_PID" 2>/dev/null || true; rm -rf "$LIB"; }
+# 请求 body 暂存文件：Windows git-bash 调原生 curl.exe 时 argv 走 ANSI 代码页，
+# 中文经 -d 直传会被破坏（invalid unicode），--data @file 字节保真
+BODY_FILE="$(mktemp /tmp/sumi-body.XXXXXX)"
+cleanup() {
+  kill "$DAEMON_PID" 2>/dev/null || true
+  # daemon 退出释放 SQLite 句柄需要一点时间（Windows 上文件占用时 rm 会失败）
+  for _ in $(seq 1 10); do rm -rf "$LIB" 2>/dev/null && break; sleep 0.3; done
+  rm -rf "$LIB" "$BODY_FILE" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 SUMI_TOKEN="$TOKEN" "$BIN" --library "$LIB" --port "$PORT" >"$LIB/daemon.log" 2>&1 &
 DAEMON_PID=$!
 
 api() { curl -sf -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "$@"; }
-post() { api -d "$2" "http://127.0.0.1:$PORT/api/v1/$1"; }
+post() { printf '%s' "$2" > "$BODY_FILE"; api --data @"$BODY_FILE" "http://127.0.0.1:$PORT/api/v1/$1"; }
+put() { printf '%s' "$2" > "$BODY_FILE"; api -X PUT --data @"$BODY_FILE" "http://127.0.0.1:$PORT/api/v1/$1"; }
 # 期待 4xx 的请求（curl -f 会以退出码 22 中断 pipefail）
-post_any() { curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "$2" "http://127.0.0.1:$PORT/api/v1/$1"; }
+post_any() { printf '%s' "$2" > "$BODY_FILE"; curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data @"$BODY_FILE" "http://127.0.0.1:$PORT/api/v1/$1"; }
 
 # 等就绪（200ms 轮询）
 for _ in $(seq 1 50); do
@@ -110,7 +119,8 @@ post lock/set '{"dimension":"tag","name":"私密","password":"pw123"}' | grep -q
 post item/update "{\"id\":\"$ID\",\"tags\":[\"私密\"]}" | grep -q success || { echo "FAIL: 打私密标签"; exit 1; }
 post_any item/list '{"tags":["私密"]}' | grep -q LOCKED || { echo "FAIL: 未解锁筛选应 403"; exit 1; }
 TICKET=$(post lock/unlock '{"dimension":"tag","name":"私密","password":"pw123"}' | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['unlock_token'])")
-curl -sf -H "Authorization: Bearer $TOKEN" -H "X-Sumi-Unlock: $TICKET" -H "Content-Type: application/json" -d '{"tags":["私密"]}' "http://127.0.0.1:$PORT/api/v1/item/list" | grep -q '"total":1' || { echo "FAIL: 解锁票据"; exit 1; }
+printf '%s' '{"tags":["私密"]}' > "$BODY_FILE"
+curl -sf -H "Authorization: Bearer $TOKEN" -H "X-Sumi-Unlock: $TICKET" -H "Content-Type: application/json" --data @"$BODY_FILE" "http://127.0.0.1:$PORT/api/v1/item/list" | grep -q '"total":1' || { echo "FAIL: 解锁票据"; exit 1; }
 post item/list '{"keywords":["三体"]}' | grep -q '"total":0' || { echo "FAIL: 全局视图应排除锁内条目"; exit 1; }
 post lock/remove '{"dimension":"tag","name":"私密","password":"pw123"}' | grep -q success || { echo "FAIL: lock remove"; exit 1; }
 post item/list '{"keywords":["三体"]}' | grep -q '"total":1' || { echo "FAIL: 解锁后应恢复可见"; exit 1; }
@@ -130,9 +140,9 @@ post folder/delete '{"path":"已读"}' | grep -q success || { echo "FAIL: folder
 echo "ok folder"
 
 # view 偏好与 global_filter
-api -X PUT -d '{"scope":"tag:科幻","order_by":"title","order":"asc"}' "http://127.0.0.1:$PORT/api/v1/view/preference" | grep -q success || { echo "FAIL: view put"; exit 1; }
+put view/preference '{"scope":"tag:科幻","order_by":"title","order":"asc"}' | grep -q success || { echo "FAIL: view put"; exit 1; }
 api "http://127.0.0.1:$PORT/api/v1/view/preferences" | grep -q '科幻' || { echo "FAIL: view get"; exit 1; }
-api -X PUT -d '{"kind":"tag","name":"科幻","hidden":true}' "http://127.0.0.1:$PORT/api/v1/global_filter" | grep -q success || { echo "FAIL: gf put"; exit 1; }
+put global_filter '{"kind":"tag","name":"科幻","hidden":true}' | grep -q success || { echo "FAIL: gf put"; exit 1; }
 post item/list '{"keywords":["三体"]}' | grep -q '"total":1' || { echo "FAIL: global_filter 为客户端约定式（服务端放行，客户端附 exclude_*）"; exit 1; }
 post item/list '{"keywords":["三体"],"exclude_tags":["私密"]}' | grep -q '"total":0' || { echo "FAIL: exclude_tags 剔除"; exit 1; }
 echo "ok view/global_filter"

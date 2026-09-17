@@ -49,7 +49,10 @@ impl LibraryPaths {
         let sumi_dir = join_path(&root, SUMI_DIR_NAME);
         let metadata_dir = join_path(&sumi_dir, "metadata");
         let covers_dir = join_path(&sumi_dir, "covers");
-        let parent = cache_parent.unwrap_or_else(default_cache_parent_sumi);
+        // 缓存父目录同样归一化为正斜杠：与 root 的包含关系校验（cache_location_error）口径一致
+        let parent = cache_parent
+            .map(|p| full_path(&p))
+            .unwrap_or_else(default_cache_parent_sumi);
         let cache_dir = join_path(&parent, &cache_dir_name(&root));
         let cache_covers_dir = join_path(&cache_dir, "covers");
         let cache_content_dir = join_path(&cache_dir, "content");
@@ -288,14 +291,31 @@ fn is_absolute_path(p: &str) -> bool {
 fn canonicalize_root(root: &str) -> String {
     let p = full_path(root);
     match std::fs::canonicalize(&p) {
-        Ok(real) => real.to_string_lossy().into_owned(),
+        Ok(real) => full_path(&strip_verbatim_prefix(&real.to_string_lossy())),
         Err(_) => p,
     }
+}
+
+/// Windows std::fs::canonicalize 返回 verbatim 路径（`\\?\D:\...`）：该前缀关闭路径归一化，
+/// 与正斜杠拼接得到的是 InvalidFilename 非法路径，必须剥回常规形态
+/// （`\\?\UNC\server\share` → `\\server\share`）。非 Windows 无此前缀，原样返回
+fn strip_verbatim_prefix(p: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+            return std::borrow::Cow::Owned(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = p.strip_prefix(r"\\?\") {
+            return std::borrow::Cow::Borrowed(rest);
+        }
+    }
+    std::borrow::Cow::Borrowed(p)
 }
 
 /// 简易 GetFullPath：绝对化 + 文本化归约 . 与 .. 组件（不解析符号链接，避免 Windows \\?\ 前缀）
 pub fn full_path(p: &str) -> String {
     let p = p.replace('\\', "/");
+    let unc = p.starts_with("//"); // UNC（\\server\share）：双斜杠前缀必须保留
     let mut out: Vec<&str> = Vec::new();
     for seg in p.split('/') {
         match seg {
@@ -307,7 +327,9 @@ pub fn full_path(p: &str) -> String {
         }
     }
     let joined = out.join("/");
-    if p.starts_with('/') {
+    if unc {
+        format!("//{joined}")
+    } else if p.starts_with('/') {
         format!("/{joined}")
     } else {
         joined
@@ -355,7 +377,7 @@ fn default_cache_parent() -> String {
 
 /// 默认缓存父目录（<系统缓存>/sumi/cache）
 fn default_cache_parent_sumi() -> String {
-    join_path(&default_cache_parent(), "sumi/cache")
+    full_path(&join_path(&default_cache_parent(), "sumi/cache"))
 }
 
 /// 缓存子目录名：库文件夹名_路径哈希前16位（小写十六进制）
@@ -465,6 +487,36 @@ mod tests {
         assert_eq!(LibraryPaths::name_of(".hidden"), ".hidden");
         assert_eq!(LibraryPaths::dir_of("novels/科幻/三体.epub"), "novels/科幻");
         assert_eq!(LibraryPaths::dir_of("三体.epub"), "");
+    }
+
+    #[test]
+    fn full_path_normalizes() {
+        assert_eq!(full_path(r"D:\lib\..\lib2"), "D:/lib2");
+        assert_eq!(full_path("/data/./lib"), "/data/lib");
+        // UNC（\\server\share）双斜杠前缀必须保留，折叠成单斜杠会变成本地路径
+        assert_eq!(full_path(r"\\NAS\books\科幻"), "//NAS/books/科幻");
+        assert_eq!(full_path("//NAS/books"), "//NAS/books");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn verbatim_prefix_stripped() {
+        assert_eq!(strip_verbatim_prefix(r"\\?\D:\lib").as_ref(), r"D:\lib");
+        assert_eq!(strip_verbatim_prefix(r"\\?\UNC\nas\books").as_ref(), r"\\nas\books");
+        assert_eq!(strip_verbatim_prefix(r"D:\lib").as_ref(), r"D:\lib");
+    }
+
+    /// Windows 回归：canonicalize 的 \\\?\\ 前缀曾让 to_absolute 全部失配、拼接路径非法
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn canonicalized_root_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("sumi-canon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = LibraryPaths::new(dir.to_str().unwrap(), Some("C:/sumi-test-cache".to_string()));
+        assert!(!paths.root.starts_with(r"\\?\"), "root 带 verbatim 前缀: {}", paths.root);
+        let abs = paths.to_absolute("novels/x.epub").expect("to_absolute 失配");
+        assert_eq!(paths.to_relative(&abs), Some("novels/x.epub".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
