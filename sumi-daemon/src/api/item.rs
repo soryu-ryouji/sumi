@@ -767,6 +767,7 @@ async fn cover_put(
     let dto = project_item(&state, &updated);
     drop(index);
     state.bus.emit_json(crate::core::events::names::ITEM_UPDATED, &dto);
+    spawn_embed(&state, &updated);
     Ok(axum::Json(serde_json::json!({ "status": "success", "data": dto })))
 }
 
@@ -796,15 +797,54 @@ async fn cover_delete(
     }
     let index = state.index.lock().unwrap();
     if let Some(item) = index.get(&params.id) {
-        let dto = project_item(&state, item);
+        let item = item.clone();
+        let dto = project_item(&state, &item);
         drop(index);
         state.bus.emit_json(crate::core::events::names::ITEM_UPDATED, &dto);
+        // 删除自定义封面后回写：文件封面收敛到回退源（派生缓存或不动）
+        spawn_embed(&state, &item);
     }
     Ok(envelope::success())
 }
 
 fn io_err(e: std::io::Error) -> envelope::ApiError {
     envelope::ApiError::internal(format!("IO 失败: {e}"))
+}
+
+/// 保存成功后自动回写 EPUB/PDF 元数据（后台阻塞任务执行；失败仅广播 item.embed_failed，
+/// 不影响保存响应本身）。写回改变文件哈希 → item id 漂移由 watcher 经 migrate_id_drift 收敛。
+fn spawn_embed(state: &SharedState, item: &ItemCore) {
+    if !crate::core::embed::has_embeddable_path(item) {
+        return;
+    }
+    let paths = state.paths.clone();
+    let bus = state.bus.clone();
+    let item = item.clone();
+    tokio::task::spawn_blocking(move || {
+        let covers_dir = paths.covers_dir.clone();
+        let cache_covers_dir = paths.cache_covers_dir.clone();
+        let id = item.id.clone();
+        // 回写封面：自定义封面优先，回退派生缓存；webp 解码转 PNG（失败按无封面处理，不动文件封面条目）
+        let cover_png = load_embed_cover_png(&covers_dir, &cache_covers_dir, &id);
+        let failures = crate::core::embed::embed_metadata(&paths, &item, cover_png.as_deref());
+        if !failures.is_empty() {
+            bus.emit_json(
+                crate::core::events::names::ITEM_EMBED_FAILED,
+                &serde_json::json!({ "id": id, "failures": failures }),
+            );
+        }
+    });
+}
+
+/// 回写封面源：自定义 covers/<id>.webp → 派生缓存 covers/<id>.webp → None；解码后转 PNG
+fn load_embed_cover_png(covers_dir: &str, cache_covers_dir: &str, id: &str) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(format!("{covers_dir}/{id}.webp"))
+        .ok()
+        .or_else(|| std::fs::read(format!("{cache_covers_dir}/{id}.webp")).ok())?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    Some(png)
 }
 
 fn require_writable(access: AccessLevel) -> Result<(), envelope::ApiError> {
@@ -1195,6 +1235,20 @@ async fn update(
     let dto = project_item(&state, &item);
     drop(index);
     state.bus.emit_json(crate::core::events::names::ITEM_UPDATED, &dto);
+    // 回写门控：仅 embed 相关字段（title/authors/publisher/description/tags/categories/series/series_index）
+    // 实际出现在请求体时才回写文件——阅读状态/进度/评分/备注等高频非元数据变更
+    // 不应引发整文件重写与 item id 哈希漂移
+    let embed_touched = body.title.is_some()
+        || body.authors.is_some()
+        || body.publisher.is_some()
+        || body.description.is_some()
+        || body.tags.is_some()
+        || body.categories.is_some()
+        || body.series.is_some()
+        || body.series_index.is_some();
+    if embed_touched {
+        spawn_embed(&state, &item);
+    }
     Ok(axum::Json(serde_json::json!({ "status": "success", "data": dto })))
 }
 
@@ -1346,6 +1400,17 @@ async fn batch_update(
     drop(index);
     if !updated_dtos.is_empty() {
         state.bus.emit_json(crate::core::events::names::ITEMS_UPDATED, &updated_dtos);
+    }
+    // 回写门控：仅批量改动含标签/分类（embed 相关字段）时才回写文件——
+    // 评分/阅读状态/移动目录等高频或非元数据变更不引发整文件重写与 id 哈希漂移
+    let embed_touched = body.add_tags.is_some()
+        || body.add_categories.is_some()
+        || body.remove_tags.is_some()
+        || body.remove_categories.is_some();
+    if embed_touched {
+        for it in &updated {
+            spawn_embed(&state, it);
+        }
     }
     Ok(axum::Json(serde_json::json!({
         "status": "success",

@@ -16,8 +16,8 @@ pub struct EpubBook {
     pub opf_dir: String,
 }
 
-/// 解析 META-INF/container.xml 定位 OPF
-fn locate_opf(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> Option<(String, String)> {
+/// 解析 META-INF/container.xml 定位 OPF（embed 回写复用）
+pub(crate) fn locate_opf(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> Option<(String, String)> {
     let mut file = archive.by_name("META-INF/container.xml").ok()?;
     let mut xml = String::new();
     file.read_to_string(&mut xml).ok()?;
@@ -64,25 +64,25 @@ struct OpfMetadata {
 }
 
 #[derive(Default, Clone)]
-struct ManifestItem {
-    id: String,
-    href: String,
+pub(crate) struct ManifestItem {
+    pub(crate) id: String,
+    pub(crate) href: String,
     media_type: String,
     properties: String,
 }
 
 #[derive(Default)]
-struct Opf {
+pub(crate) struct Opf {
     metadata: OpfMetadata,
-    manifest: Vec<ManifestItem>,
+    pub(crate) manifest: Vec<ManifestItem>,
     spine: Vec<String>,
-    cover_item_id: Option<String>,
+    pub(crate) cover_item_id: Option<String>,
     /// metadata `<meta name="cover" content="<manifest id 或 href>">`（EPUB 2 / calibre 标准形态；
     /// 与 item name 属性、EPUB 3 properties 三源合并，先到先得）
     meta_cover_ref: Option<String>,
 }
 
-fn parse_opf(xml: &str) -> Opf {
+pub(crate) fn parse_opf(xml: &str) -> Opf {
     let mut opf = Opf::default();
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -90,6 +90,14 @@ fn parse_opf(xml: &str) -> Opf {
     let mut section = String::new();
     let mut text_target: Option<&'static str> = None;
     let mut pending_meta_name = String::new();
+    // EPUB 3 属性形态系列 meta（文本体）：<meta property="…" id/refines>text</meta>
+    let mut pending_prop: Option<(String, String)> = None; // (property, refines)
+    let mut pending_prop_id = String::new();
+    let mut pending_prop_text = String::new();
+    // 收集后统一回填（collection-type 可能先于 belongs-to-collection 出现）
+    let mut collections: Vec<(String, String)> = Vec::new(); // (id, 名称)
+    let mut series_ids: Vec<String> = Vec::new(); // collection-type=series 的集合 id
+    let mut positions: Vec<(String, f64)> = Vec::new(); // (集合 id, group-position)
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -111,14 +119,25 @@ fn parse_opf(xml: &str) -> Opf {
                         // 属性式 <meta name="..." content="...">（含 Start 形式，calibre 全系
                         // `<meta name="cover" content="<id>"/>` 在此命中）；text 体式极罕见，不展开
                         let mut content = String::new();
+                        let mut property = String::new();
+                        let mut refines = String::new();
+                        let mut meta_id = String::new();
                         for attr in e.attributes().flatten() {
                             match attr.key.as_ref() {
                                 b"name" => pending_meta_name = String::from_utf8_lossy(&attr.value).into_owned(),
                                 b"content" => content = String::from_utf8_lossy(&attr.value).into_owned(),
+                                b"property" => property = String::from_utf8_lossy(&attr.value).into_owned(),
+                                b"refines" => refines = String::from_utf8_lossy(&attr.value).into_owned(),
+                                b"id" => meta_id = String::from_utf8_lossy(&attr.value).into_owned(),
                                 _ => {}
                             }
                         }
-                        if !pending_meta_name.is_empty() && !content.is_empty() {
+                        if !property.is_empty() {
+                            // EPUB 3 文本体 meta（belongs-to-collection 系列），文本在 Start/End 之间
+                            pending_prop = Some((property, refines));
+                            pending_prop_id = meta_id;
+                            pending_prop_text.clear();
+                        } else if !pending_meta_name.is_empty() && !content.is_empty() {
                             let name = pending_meta_name.clone();
                             apply_meta(&mut opf, &name, &content);
                         }
@@ -224,12 +243,32 @@ fn parse_opf(xml: &str) -> Opf {
                         _ => {}
                     }
                 }
+                if pending_prop.is_some() {
+                    pending_prop_text.push_str(&t.unescape().unwrap_or_default());
+                }
             }
             Ok(Event::End(e)) => {
                 let name_str = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 match name_str.as_str() {
                     "metadata" | "manifest" | "spine" => section.clear(),
                     _ => {}
+                }
+                if name_str == "meta" || name_str.ends_with(":meta") {
+                    // EPUB 3 系列修饰 meta 收口：belongs-to-collection 收集名称，refines 修饰定类型与序号
+                    if let Some((property, refines)) = pending_prop.take() {
+                        let text = pending_prop_text.trim().to_string();
+                        let target = refines.trim_start_matches('#').to_string();
+                        match property.as_str() {
+                            "belongs-to-collection" => collections.push((pending_prop_id.clone(), text)),
+                            "collection-type" if text == "series" => series_ids.push(target),
+                            "group-position" => {
+                                if let Ok(v) = text.parse::<f64>() {
+                                    positions.push((target, v));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 text_target = None;
             }
@@ -245,6 +284,20 @@ fn parse_opf(xml: &str) -> Opf {
         if let Some(r) = &opf.meta_cover_ref {
             if let Some(item) = opf.manifest.iter().find(|i| &i.id == r || i.href == *r) {
                 opf.cover_item_id = Some(item.id.clone());
+            }
+        }
+    }
+    // EPUB 3 标准系列字段回填（calibre 约定优先：已在 attribute 式 meta 中读到则不动）
+    if opf.metadata.series.is_empty() {
+        for (id, name) in &collections {
+            if series_ids.iter().any(|s| s == id) {
+                opf.metadata.series = name.clone();
+                opf.metadata.series_index = positions
+                    .iter()
+                    .find(|(r, _)| r == id)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0.0);
+                break;
             }
         }
     }

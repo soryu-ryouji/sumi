@@ -1,6 +1,7 @@
 //! 领域核心：存储底座、索引流水线、解析器、事件总线。
 
 pub mod config;
+pub mod embed;
 pub mod fulltext;
 pub mod cover;
 pub mod index;

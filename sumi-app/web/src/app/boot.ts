@@ -75,6 +75,13 @@ function subscribeServerEvents(): void {
           books.patchItem(item);
         }
       },
+      'item.embed_failed': (p) => {
+        // EPUB/PDF 元数据自动回写文件失败：逐个失败路径 toast（库内元数据已保存成功，文件未改动，无需刷新列表）
+        const { failures } = p as { failures: { path: string; error: string }[] };
+        for (const f of failures ?? []) {
+          ui.toastError(`元数据写入文件失败（${f.path}）：${f.error}`);
+        }
+      },
       'item.trashed': (p) => {
         books.dropItem((p as { id: string }).id);
         // 回收站态下新移入的条目需刷新列表（与 item.restored 对称）

@@ -15,6 +15,8 @@ pub mod names {
     pub const ITEM_TRASHED: &str = "item.trashed";
     pub const ITEM_RESTORED: &str = "item.restored";
     pub const ITEM_REMOVED: &str = "item.removed";
+    /// 保存时自动回写 EPUB/PDF 文件失败的广播（负载 { id, failures: [{ path, error }] }）
+    pub const ITEM_EMBED_FAILED: &str = "item.embed_failed";
     pub const FOLDER_CHANGED: &str = "folder.changed";
     pub const LIBRARY_UPDATED: &str = "library.updated";
     pub const GLOBAL_FILTER_CHANGED: &str = "global_filter.changed";
