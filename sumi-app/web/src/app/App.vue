@@ -3,10 +3,11 @@
 // 窗口拖拽区由各视图顶部承担（DragBar / 侧栏顶条 / TopBar），无整窗通栏标题栏；
 // Windows/Linux 的窗口控制为 fixed 右上角（内容按 CONTROLS_INSET 避让）。
 // server 错误覆盖层在最外层兜底。
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useConnection } from '@/stores/connection';
 import { boot } from './boot';
 import { shell } from './shell';
+import { startupAutoCheck } from '@/shared/lib/updater';
 import ConnectScreen from './screens/ConnectScreen.vue';
 import StartingScreen from './screens/StartingScreen.vue';
 import WindowControls from './chrome/WindowControls.vue';
@@ -51,6 +52,16 @@ onUnmounted(() => {
 });
 
 const screen = computed<'connect' | 'starting' | 'main'>(() => (conn.ready ? 'main' : startingExpected.value ? 'starting' : 'connect'));
+
+// 主界面就绪后触发一次启动静默检查（延迟 8s，每会话一次；见 shared/lib/updater.ts）
+watch(
+  () => conn.ready,
+  (ready) => {
+    if (ready) {
+      startupAutoCheck();
+    }
+  },
+);
 
 function quitApp(): void {
   void shell()?.quitApp();

@@ -8,6 +8,7 @@ import path from 'node:path';
 import { getMainWindow } from './window';
 import { getLibraryRoot, listLibraries, readConfig, removeLibraryHistory, writeConfig } from './app-config';
 import { getStartedConn, openLibraryAt, pickLibrary, restartServerWithCacheParent } from './server';
+import { registerUpdaterIpc } from './updater';
 import { IPC } from './ipc-contract';
 
 // webUtils 不在 electron 的 ESM 命名导出里，经 default export 解构
@@ -32,6 +33,8 @@ function historyPath(p: string): string | null {
 }
 
 export function registerIpc(): void {
+  registerUpdaterIpc();
+
   ipcMain.handle(IPC.winMinimize, () => getMainWindow()?.minimize());
   ipcMain.handle(IPC.winMaximizeToggle, () => {
     const win = getMainWindow();

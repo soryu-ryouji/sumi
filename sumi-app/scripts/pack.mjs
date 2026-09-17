@@ -3,6 +3,10 @@
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stampBuildInfo } from './stamp-build.mjs';
+
+// 打包前写入构建标识（nightly 通道比较新旧用；缺则 nightly 检查报「开发构建无构建标识」）
+stampBuildInfo();
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 

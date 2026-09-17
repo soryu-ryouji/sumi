@@ -46,7 +46,7 @@ export const useUi = defineStore('ui', {
     showInspector: readPanels().inspector,
     /** 设置浮动对话框显隐（顶栏开关；设置不再是路由视图，书库界面保留在背景） */
     settingsOpen: false,
-    settingsTab: 'library' as 'library' | 'openers' | 'scan' | 'lan' | 'cache' | 'locks' | 'about',
+    settingsTab: 'library' as 'library' | 'openers' | 'scan' | 'lan' | 'cache' | 'locks' | 'update' | 'about',
     toasts: [] as Toast[],
   }),
   actions: {

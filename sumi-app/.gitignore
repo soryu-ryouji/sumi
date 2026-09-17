@@ -2,3 +2,5 @@ node_modules/
 dist/
 electron/out/
 resources/
+# 构建标识（pack 前 stamp-build.mjs 生成，不入库；内容随构建变化）
+build-info.json

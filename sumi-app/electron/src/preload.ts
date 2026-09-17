@@ -22,6 +22,16 @@ const api: SumiShell = {
   toggleMaximizeWindow: () => ipcRenderer.invoke(IPC.winMaximizeToggle),
   closeWindow: () => ipcRenderer.invoke(IPC.winClose),
   quitApp: () => ipcRenderer.invoke(IPC.quitApp),
+  getAppVersion: () => ipcRenderer.invoke(IPC.appVersion),
+  checkUpdate: (channel) => ipcRenderer.invoke(IPC.updateCheck, channel),
+  downloadUpdate: () => ipcRenderer.invoke(IPC.updateDownload),
+  cancelUpdate: () => ipcRenderer.invoke(IPC.updateCancel),
+  installUpdate: () => ipcRenderer.invoke(IPC.updateInstall),
+  onUpdateProgress: (cb) => {
+    const listener = (_e: unknown, payload: Parameters<typeof cb>[0]) => cb(payload);
+    ipcRenderer.on(IPC.updateProgress, listener);
+    return () => ipcRenderer.off(IPC.updateProgress, listener);
+  },
   onServerStarted: (cb) => {
     const listener = (_e: unknown, payload: Parameters<typeof cb>[0]) => cb(payload);
     ipcRenderer.on(IPC.serverStarted, listener);

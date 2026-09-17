@@ -22,6 +22,11 @@ export const IPC = {
   winMaximizeToggle: 'sumi:win-maximize-toggle',
   winClose: 'sumi:win-close',
   quitApp: 'sumi:quit-app',
+  appVersion: 'sumi:app-version',
+  updateCheck: 'sumi:update-check',
+  updateDownload: 'sumi:update-download',
+  updateCancel: 'sumi:update-cancel',
+  updateInstall: 'sumi:update-install',
   // ---- 主进程 → 渲染进程（webContents.send / ipcRenderer.on） ----
   winMaximized: 'sumi:win-maximized',
   serverProgress: 'sumi:server-progress',
@@ -29,6 +34,7 @@ export const IPC = {
   serverStarted: 'sumi:server-started',
   serverConn: 'sumi:server-conn',
   serverError: 'sumi:server-error',
+  updateProgress: 'sumi:update-progress',
 } as const;
 
 /** 素材库历史条目（主进程记录，最近使用在前） */
@@ -55,6 +61,34 @@ export interface ServerProgress {
   processed: number;
   total: number;
 }
+
+/** 更新通道：stable=正式版（比 semver）；nightly=滚动预发布（比构建 sha） */
+export type UpdateChannel = 'stable' | 'nightly';
+
+/** 应用更新信息（主进程查询 GitHub Releases 的结果） */
+export interface UpdateInfo {
+  channel: UpdateChannel;
+  /** stable：版本号（无 v 前缀）；nightly：目标 commit 短 sha */
+  version: string;
+  /** Release 说明（nightly 为触发提交信息） */
+  notes: string;
+  /** Release 页面链接 */
+  url: string;
+  assetName: string;
+  /** 更新包字节数（未知为 0） */
+  size: number;
+  /** 安装包已在本地且 sha256 校验通过（磁盘缓存命中）：可跳过下载直接安装 */
+  downloaded: boolean;
+}
+
+/** 用户取消下载的哨兵错误消息（渲染层识别后静默回 available，不进 error 态） */
+export const UPDATE_CANCELLED = 'UPDATE_CANCELLED';
+
+/** 更新包下载进度事件 */
+export type UpdateProgress =
+  | { phase: 'downloading'; received: number; total: number }
+  | { phase: 'verifying' }
+  | { phase: 'ready' };
 
 /** Electron preload 注入的白名单通道（window.sumiShell；浏览器纯前端调试时不存在） */
 export interface SumiShell {
@@ -93,6 +127,18 @@ export interface SumiShell {
   closeWindow(): Promise<void>;
   /** 真正退出应用（启动错误屏用） */
   quitApp(): Promise<void>;
+  /** 当前应用版本与构建 sha（sha='dev' 表示无构建标识，如开发态） */
+  getAppVersion(): Promise<{ version: string; sha: string }>;
+  /** 检查更新（stable=latest 正式版比 semver；nightly=滚动预发布比构建 sha）；无更新返回 null */
+  checkUpdate(channel: UpdateChannel): Promise<UpdateInfo | null>;
+  /** 下载并校验上次检查到的更新（进度经 onUpdateProgress 推送；已就绪时幂等） */
+  downloadUpdate(): Promise<void>;
+  /** 取消进行中的下载（清半成品；无下载在跑时为空操作） */
+  cancelUpdate(): Promise<void>;
+  /** 重启并安装已下载的更新（成功后应用退出，不再返回） */
+  installUpdate(): Promise<void>;
+  /** 订阅更新包下载进度，返回退订函数 */
+  onUpdateProgress(cb: (p: UpdateProgress) => void): () => void;
   /** 订阅 server 就绪（携带新地址与 token，需重配 API 并重启数据），返回退订函数。
    *  事件只发一次：页面（重）加载晚于就绪时会丢失，须与 getServerConn 拉取配合 */
   onServerStarted(cb: (conn: ServerConn) => void): () => void;

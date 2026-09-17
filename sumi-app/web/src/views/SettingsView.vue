@@ -13,6 +13,9 @@ import { useLibrary } from '@/stores/library';
 import { useConnection } from '@/stores/connection';
 import { api } from '@/shared/api/client';
 import { shell } from '@/app/shell';
+import { hasShell } from '@/shared/lib/platform';
+import { useUpdater } from '@/shared/lib/updater';
+import { formatBytes } from '@/shared/format';
 import type { DimensionNames, LanConfig } from '@/shared/api/types';
 
 const ui = useUi();
@@ -26,6 +29,7 @@ const TABS = [
   { key: 'lan', label: '局域网' },
   { key: 'cache', label: '缓存' },
   { key: 'locks', label: '锁' },
+  { key: 'update', label: '更新' },
   { key: 'about', label: '关于' },
 ] as const;
 
@@ -217,12 +221,38 @@ async function removeLock(dim: string, name: string): Promise<void> {
   }
 }
 const DIM_LABEL: Record<string, string> = { folders: '文件夹', categories: '分类', tags: '标签', authors: '作者' };
+// lock/* API 的 dimension 用单数（folder/category/tag/author），显式映射（slice(0,-1) 会把 categories 截成 categorie）
+const DIM_SINGULAR: Record<string, string> = { folders: 'folder', categories: 'category', tags: 'tag', authors: 'author' };
 const lockEntries = computed(() => {
   const l = locks.value;
   if (!l) {
     return [];
   }
   return (['folders', 'categories', 'tags', 'authors'] as const).flatMap((key) => l[key].map((name) => ({ dim: key, name })));
+});
+
+// ---- 更新（状态机见 shared/lib/updater.ts） ----
+const updater = useUpdater();
+const appVersion = ref('');
+const buildSha = ref('');
+onMounted(() => {
+  void shell()?.getAppVersion().then((v) => {
+    appVersion.value = v.version;
+    buildSha.value = v.sha;
+  });
+});
+/** 下载百分比（total 未知时为 null，UI 显示已下载字节数） */
+const downloadPct = computed(() => {
+  const p = updater.progress.value;
+  return p && p.total > 0 ? Math.floor((p.received / p.total) * 100) : null;
+});
+/** 发现的新版本标签（nightly 显示短 sha，稳定版带 v 前缀） */
+const updateLabel = computed(() => {
+  const info = updater.update.value;
+  if (!info) {
+    return '';
+  }
+  return info.channel === 'nightly' ? `nightly ${info.version}` : `v${info.version}`;
 });
 
 // ---- 浮动对话框生命周期 ----
@@ -356,7 +386,7 @@ useEventListener(
                 <div v-for="entry in lockEntries" :key="entry.dim + entry.name" class="lock-row">
                   <span class="chip">{{ DIM_LABEL[entry.dim] }}</span>
                   <span class="lock-name">{{ entry.name }}</span>
-                  <button v-if="conn.isAdmin" class="btn small" @click="removeLock(entry.dim === 'folders' ? 'folder' : entry.dim.slice(0, -1), entry.name)">解除</button>
+                  <button v-if="conn.isAdmin" class="btn small" @click="removeLock(DIM_SINGULAR[entry.dim], entry.name)">解除</button>
                 </div>
               </div>
               <div v-else class="hint">当前没有上锁的条目。</div>
@@ -381,13 +411,69 @@ useEventListener(
               <p class="hint">已解锁 {{ conn.unlockTickets.length }} 项（票据随服务重启失效）。</p>
             </template>
 
+            <!-- 更新（仅桌面端；状态机见 shared/lib/updater.ts） -->
+            <template v-else-if="ui.settingsTab === 'update'">
+              <template v-if="hasShell()">
+                <h3>应用更新</h3>
+                <div class="form-row"><span class="form-label">当前版本</span><span>{{ !buildSha ? '…' : buildSha === 'dev' ? '开发版' : `v${appVersion} · ${buildSha.slice(0, 7)}` }}</span></div>
+
+                <div class="form-row"><span class="form-label">更新通道</span>
+                  <label class="channel-radio"><input type="radio" value="stable" :checked="updater.channel.value === 'stable'" @change="updater.setChannel('stable')" /> 稳定版</label>
+                  <label class="channel-radio"><input type="radio" value="nightly" :checked="updater.channel.value === 'nightly'" @change="updater.setChannel('nightly')" /> 滚动版（nightly）</label>
+                </div>
+                <p class="hint">滚动版包含最新改动，稳定性不作保证；切换通道后需重新检查更新。</p>
+
+                <div class="form-row"><span class="form-label">检查更新</span>
+                  <span class="update-status">
+                    <template v-if="updater.phase.value === 'checking'">正在检查…</template>
+                    <template v-else-if="updater.phase.value === 'uptodate'">已是最新（{{ updater.channel.value === 'nightly' ? 'nightly' : '稳定版' }}）</template>
+                    <template v-else-if="updater.update.value">
+                      发现新版本 {{ updateLabel }}
+                      <a :href="updater.update.value.url" target="_blank" rel="noreferrer">发布说明</a>
+                    </template>
+                    <template v-else-if="updater.phase.value === 'error'">检查失败</template>
+                    <template v-else>未检查</template>
+                  </span>
+                </div>
+                <p v-if="updater.error.value" class="update-error">{{ updater.error.value }}</p>
+
+                <div v-if="updater.phase.value === 'downloading'" class="update-progress">
+                  <div class="update-progress-bar">
+                    <div class="update-progress-fill" :style="{ width: downloadPct !== null ? downloadPct + '%' : '100%' }" :class="{ indeterminate: downloadPct === null }" />
+                  </div>
+                  <span class="update-progress-text">
+                    {{
+                      updater.verifying.value
+                        ? '校验中…'
+                        : updater.progress.value
+                          ? `${formatBytes(updater.progress.value.received)} / ${updater.progress.value.total > 0 ? formatBytes(updater.progress.value.total) : '…'}`
+                          : '准备下载…'
+                    }}
+                  </span>
+                </div>
+
+                <div class="update-actions">
+                  <button class="btn" :disabled="updater.phase.value === 'checking' || updater.phase.value === 'downloading' || updater.phase.value === 'ready'" @click="void updater.check()">检查更新</button>
+                  <button v-if="updater.phase.value === 'available'" class="btn primary" @click="void updater.downloadAndInstall()">下载并安装</button>
+                  <button v-if="updater.phase.value === 'downloading'" class="btn" @click="void updater.cancel()">取消下载</button>
+                  <button v-if="updater.phase.value === 'ready'" class="btn primary" @click="void updater.install()">重启并安装</button>
+                </div>
+                <p v-if="updater.phase.value === 'ready'" class="hint">安装包已下载并校验。重启后自动完成安装。</p>
+                <p v-if="updater.phase.value === 'error'" class="hint">检查/下载失败后可重试；网络受限时 GitHub API 有访问限速（每小时 60 次）。</p>
+              </template>
+              <template v-else>
+                <h3>应用更新</h3>
+                <p class="hint">仅桌面端支持自动更新；浏览器形态请直接访问 Release 页获取新版本。</p>
+              </template>
+            </template>
+
             <!-- 关于 -->
             <template v-else>
               <div class="about">
                 <img src="/icon.png" alt="sumi" />
                 <h3>sumi</h3>
                 <p>对标 Calibre 的开源书籍/文本资源管理工具</p>
-                <p class="hint">daemon {{ conn.appInfo?.version }} · app 0.1.0 · {{ conn.appInfo?.platform }}</p>
+                <p class="hint">daemon {{ conn.appInfo?.version }} · app {{ appVersion || (hasShell() ? '…' : 'web') }} · {{ conn.appInfo?.platform }}</p>
               </div>
             </template>
           </div>
@@ -555,5 +641,67 @@ h4 {
   margin: 0;
   font-size: 13px;
   color: var(--muted);
+}
+
+/* ---- 更新分区 ---- */
+.channel-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  margin-right: 16px;
+  cursor: pointer;
+}
+.update-status {
+  font-size: 13px;
+}
+.update-status a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.update-error {
+  font-size: 12px;
+  color: var(--danger);
+  margin: -8px 0 12px;
+}
+.update-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.update-progress-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+.update-progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+}
+/* total 未知时不定态进度条 */
+.update-progress-fill.indeterminate {
+  width: 40%;
+  animation: update-indeterminate 1.1s ease-in-out infinite;
+}
+@keyframes update-indeterminate {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}
+.update-progress-text {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.update-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 </style>

@@ -1,0 +1,507 @@
+# 单流水线：质量门禁 + 发版。检查（rust/desktop）与构建/发布经 needs 串联——
+# 检查全绿后才进入构建，任一检查失败则发布整链跳过，nightly/stable 永远来自通过测试的代码。
+#
+# 触发与行为：
+# - push(main) / PR：rust daemon 单测 + desktop 完整复现本机构建链
+#   （web/主进程/后端构建 → 双 tsc → gen:types 契约同步校验 → 后端 48 断言冒烟 → 打包冒烟）
+# - push(main) 且提交信息以 release 开头：正式 Release（版本号取自提交首行并与 package.json 校验，
+#   tag+Release 由 action-gh-release 的 tag_name 直接创建——GITHUB_TOKEN 创建的 tag 不会触发
+#   其他 workflow，不能用「先建 tag 再触发构建」的链式设计）
+# - push(main) 且提交信息以 feat/fix 开头（conventional commits）：滚动更新 nightly 预发布（固定 tag=nightly，prerelease）
+# - workflow_dispatch：只构建上传 Artifacts，不创建 Release
+#
+# 压缩级别按构建类型分流：正式版（release 提交）mx=9 最小体积；nightly/手动 mx=5 快速出包
+# （mx=9 压缩耗时翻倍只换 ~10-20MB 体积；下载走 GitHub CDN，仅正式版在意最小体积）
+# Windows 产物为 zip（解压即用，全 64 位，无 NSIS 启动壳）；mac 双架构 matrix 并行构建。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# GITHUB_TOKEN 最小权限：检查/构建 job 只需读；建 Release、删 nightly tag 由 publish job 单独提权
+permissions:
+  contents: read
+
+# 同分支（PR 同号）新推送取消在跑的旧 run：nightly 只关心最新 commit，过期 run 纯属浪费。
+# release 提交例外：发版构建不被后续推送打断（tag 守卫已保证幂等，中途取消只会白跑一次全量构建）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.event.head_commit.message, 'release') }}
+
+jobs:
+  # ---- 质量门禁 ----
+
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sumi-daemon
+
+      - run: cargo test
+        working-directory: sumi-daemon
+
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: sumi-app
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sumi-daemon
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: sumi-app/package-lock.json
+
+      - run: npm ci
+
+      # electron 发行包与 electron-builder 工具（appimage 打包器等）缓存：免每次 ~100MB 下载
+      - name: Cache electron & builder tools
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+          key: tools-linux-x64-${{ hashFiles('sumi-app/package-lock.json') }}
+
+      # web 构建（vue-tsc + 主进程 tsc + vite）
+      - run: npm run build
+
+      # 主进程/preload 与 daemon 构建（pack 冒烟与后端冒烟的产物来源）
+      - run: node scripts/build-electron.mjs
+      - run: node scripts/build-server.mjs
+
+      # OpenAPI → TS 类型同步校验：openapi.json 变更必须重新生成 schema.d.ts 一并提交，
+      # 否则前端类型与契约静默漂移（gen-types 直接读仓库固化的 openapi.json，不依赖 daemon 产物）
+      - name: Check generated types in sync
+        run: |
+          node scripts/gen-types.mjs
+          git diff --exit-code web/src/shared/api/schema.d.ts
+
+      # 后端端到端冒烟（48 项行为断言，SUMI_BIN 指向 build-server 产物；
+      # 路径相对 smoke.sh 内部的 sumi-daemon 工作目录）
+      - name: Backend smoke
+        run: SUMI_BIN=../sumi-app/resources/sumi-daemon/sumi-daemon bash ../tools/smoke.sh
+
+      # 打包完整性冒烟：--dir 产出未压缩目录即可验证 files/extraResources 齐全（含 electron/out 主进程）。
+      # stamp-build：electron-builder 的 files 引用 build-info.json，sumi 的 pack.mjs 不自动写（hawk 会），
+      # 需先手动执行（无 SUMI_SHA 时回落本机 git HEAD）
+      - name: Pack smoke (dir)
+        run: |
+          node scripts/stamp-build.mjs
+          node scripts/pack.mjs --dir --publish never
+
+  # ---- 发布构建（检查全绿 + 发布条件满足才跑；手动触发不受提交前缀限制）----
+
+  windows:
+    needs: [rust, desktop]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    # 手动 / main 上 release、feat、fix 开头的提交
+    outputs:
+      release_tag: ${{ steps.release.outputs.tag }}
+      release_body: ${{ steps.release.outputs.body }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.head_commit.message, 'release') ||
+      startsWith(github.event.head_commit.message, 'feat') ||
+      startsWith(github.event.head_commit.message, 'fix')
+    defaults:
+      run:
+        working-directory: sumi-app
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # sumi-update：Windows 更新辅助程序（仅 win job 构建并进产物）
+          workspaces: |
+            sumi-daemon
+            sumi-update
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: sumi-app/package-lock.json
+
+      - run: npm ci
+
+      # electron 发行包与 electron-builder 工具（7zip 等）缓存：免每次 ~100MB 下载
+      - name: Cache electron & builder tools
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: tools-win-x64-${{ hashFiles('sumi-app/package-lock.json') }}
+
+      # 正式版守卫：release 提交首行需含版本号且与 package.json 一致（版本唯一来源），
+      # 同名 tag 已存在则失败（防重复发版）；发布说明 = 提交信息去掉首行
+      - name: Resolve release
+        if: github.event_name == 'push' && startsWith(github.event.head_commit.message, 'release')
+        id: release
+        shell: bash
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          FIRST=$(printf '%s\n' "$MSG" | head -n1)
+          VERSION=$(printf '%s\n' "$FIRST" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-._+0-9A-Za-z]*)' | head -n1)
+          PKG=$(node -p "require('./package.json').version")
+          if [ -z "$VERSION" ]; then
+            echo "release 提交首行需含版本号，如：release: v0.2.0" >&2
+            exit 1
+          fi
+          if [ "$VERSION" != "$PKG" ]; then
+            echo "提交信息版本 $VERSION 与 package.json $PKG 不一致（先 bump 再提交）" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "v$VERSION" >/dev/null 2>&1; then
+            echo "tag v$VERSION 已存在，请 bump 到新版本后再发" >&2
+            exit 1
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          BODY=$(printf '%s\n' "$MSG" | tail -n +2 | sed -e '/./,$!d')
+          {
+            echo "body<<REL_EOF"
+            printf '%s\n' "$BODY"
+            echo "REL_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # nightly 版本覆写：0.0.0-nightly.<sha7>（元数据不冒充稳定版；stable 通道检查时 0.0.0 低于任何正式版，
+      # nightly 用户可随时切回稳定版）。更新判定不走版本号，走 Release body 的 sumi-nightly-sha 注释
+      - name: Nightly version
+        if: github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'release')
+        id: nightly_ver
+        shell: bash
+        run: echo "verflag=--config.extraMetadata.version=0.0.0-nightly.${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      # 构建标识（自动更新比较 nightly 新旧用，见 scripts/stamp-build.mjs）
+      - name: Stamp build info
+        run: node scripts/stamp-build.mjs
+        env:
+          SUMI_SHA: ${{ github.sha }}
+
+      # web/主进程构建与 cargo 无共享状态，并行跑：vite/vue-tsc/esbuild 藏进 cargo 的耗时里
+      # （build-update.mjs 非 Windows 平台自跳过；当前仅 win job 需要）
+      - name: Build web & native (parallel)
+        shell: bash
+        run: |
+          # 收集 pid 逐个 wait：无参 wait 恒返回 0，后台构建失败会被吞掉
+          pids=()
+          node scripts/build-server.mjs & pids+=($!)
+          node scripts/build-update.mjs & pids+=($!)
+          npm run build & pids+=($!)
+          node scripts/build-electron.mjs & pids+=($!)
+          rc=0
+          for p in "${pids[@]}"; do wait "$p" || rc=1; done
+          exit $rc
+
+      - name: Pack
+        # --publish never：禁用 electron-builder 自带发布（CI 下会隐式触发并索要 GH_TOKEN；
+        # 配置文件里写 never 会被当成自定义 publisher 模块名，只能走 CLI）——发布统一由 publish job 负责
+        run: node scripts/pack.mjs --publish never ${{ steps.nightly_ver.outputs.verflag }}
+        env:
+          # 正式版（release 提交）mx=9 最小体积；nightly/手动 mx=5 快速出包（高频构建在意时间不在意 +10-20MB）
+          ELECTRON_BUILDER_COMPRESSION_LEVEL: ${{ startsWith(github.event.head_commit.message, 'release') && '9' || '5' }}
+
+      # 自动更新校验：产物 sha256 边车（<artifact>.sha256，内容为十六进制哈希），随 Release 上传
+      - name: Generate checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 'dist/sumi-windows-x64.zip').Hash.ToLower()
+          Set-Content -NoNewline -Path 'dist/sumi-windows-x64.zip.sha256' -Value $hash
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sumi-windows-zip
+          path: |
+            sumi-app/dist/sumi-windows-x64.zip
+            sumi-app/dist/sumi-windows-x64.zip.sha256
+          if-no-files-found: error
+
+      # Release 创建/轮转统一由 publish 汇流 job 负责（三个构建 job 全并行，见文末）
+
+  # Linux AppImage：与 windows job 同构（构建 + Artifacts，发布统一走 publish 汇流）；
+  # ubuntu-latest 即 x64，cargo/electron 均原生目标无需交叉
+  linux:
+    needs: [rust, desktop]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.head_commit.message, 'release') ||
+      startsWith(github.event.head_commit.message, 'feat') ||
+      startsWith(github.event.head_commit.message, 'fix')
+    defaults:
+      run:
+        working-directory: sumi-app
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sumi-daemon
+
+      # electron 发行包与 electron-builder 工具（appimage 打包器等）缓存
+      - name: Cache electron & builder tools
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+          key: tools-linux-x64-${{ hashFiles('sumi-app/package-lock.json') }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: sumi-app/package-lock.json
+
+      - run: npm ci
+
+      # nightly 版本覆写（同 windows job；release 提交留空用 package.json version）
+      - name: Nightly version
+        if: github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'release')
+        id: nightly_ver
+        shell: bash
+        run: echo "verflag=--config.extraMetadata.version=0.0.0-nightly.${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      # 构建标识（自动更新比较 nightly 新旧用，见 scripts/stamp-build.mjs）
+      - name: Stamp build info
+        run: node scripts/stamp-build.mjs
+        env:
+          SUMI_SHA: ${{ github.sha }}
+
+      # web/主进程构建与 cargo 无共享状态，并行跑：vite/vue-tsc/esbuild 藏进 cargo 的耗时里
+      - name: Build web & daemon (parallel)
+        run: |
+          # 收集 pid 逐个 wait：无参 wait 恒返回 0，后台构建失败会被吞掉
+          pids=()
+          node scripts/build-server.mjs & pids+=($!)
+          npm run build & pids+=($!)
+          node scripts/build-electron.mjs & pids+=($!)
+          rc=0
+          for p in "${pids[@]}"; do wait "$p" || rc=1; done
+          exit $rc
+
+      - name: Pack
+        # --publish never 同 windows job（禁用隐式发布）
+        run: node scripts/pack.mjs --publish never ${{ steps.nightly_ver.outputs.verflag }}
+        env:
+          ELECTRON_BUILDER_COMPRESSION_LEVEL: ${{ startsWith(github.event.head_commit.message, 'release') && '9' || '5' }}
+
+      # 自动更新校验：产物 sha256 边车（<artifact>.sha256），随 Release 上传
+      - name: Generate checksum
+        run: |
+          f=dist/sumi-linux-x64.AppImage
+          sha256sum "$f" | cut -d' ' -f1 | tr -d '\n' > "$f.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sumi-linux-appimage
+          path: |
+            sumi-app/dist/sumi-linux-x64.AppImage
+            sumi-app/dist/sumi-linux-x64.AppImage.sha256
+          if-no-files-found: error
+
+  # macOS app：标准 runner 已是 arm64（macos-latest），x64 由交叉打包产出；双架构 matrix 并行
+  # GitHub 只能上传单文件，因此 .app 目录打 zip 发布（VS Code/Slack 同款方式）
+  macos:
+    needs: [rust, desktop]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, rid: osx-arm64, rust-target: aarch64-apple-darwin, outdir: mac-arm64 }
+          - { arch: x64, rid: osx-x64, rust-target: x86_64-apple-darwin, outdir: mac }
+    runs-on: macos-latest
+    timeout-minutes: 45
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.head_commit.message, 'release') ||
+      startsWith(github.event.head_commit.message, 'feat') ||
+      startsWith(github.event.head_commit.message, 'fix')
+    defaults:
+      run:
+        working-directory: sumi-app
+    steps:
+      - uses: actions/checkout@v7
+
+      # mac 同机双架构：rust target 分别为 aarch64/x86_64-apple-darwin（C 依赖 sqlite 等由 cc 按 -arch 编译）
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sumi-daemon
+
+      # electron 发行包与 electron-builder 工具缓存（两腿 arch 不同，key 带 arch）
+      - name: Cache electron & builder tools
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          key: tools-macos-${{ matrix.arch }}-${{ hashFiles('sumi-app/package-lock.json') }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: sumi-app/package-lock.json
+
+      - run: npm ci
+
+      # nightly 版本覆写（同 windows job；release 提交留空用 package.json version）
+      - name: Nightly version
+        if: github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'release')
+        id: nightly_ver
+        shell: bash
+        run: echo "version=0.0.0-nightly.${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      # 构建标识（自动更新比较 nightly 新旧用，mac 不走 pack.mjs，直接执行 stamp 脚本）
+      - name: Stamp build info
+        run: node scripts/stamp-build.mjs
+        env:
+          SUMI_SHA: ${{ github.sha }}
+
+      - name: Build web & main process
+        run: |
+          npm run build
+          node scripts/build-electron.mjs
+
+      # 前后端都构建到目标架构（electron-builder 直接下载对应 electron 产物；rust 同机跨 target 编译）
+      # 输出目录：arm64 → dist/mac-arm64；x64 是 mac 默认架构 → dist/mac（无后缀）
+      - name: Pack app
+        run: |
+          node scripts/build-server.mjs ${{ matrix.rid }}
+          # set -e 下不能用 [ -n "" ] && 赋值的短 circuit 写法（空值路径非零退出），显式 if
+          VER_ARGS=""
+          if [ -n "${{ steps.nightly_ver.outputs.version }}" ]; then
+            VER_ARGS="--config.extraMetadata.version=${{ steps.nightly_ver.outputs.version }}"
+          fi
+          npx electron-builder --dir --${{ matrix.arch }} --publish never $VER_ARGS
+          ditto -c -k --keepParent dist/${{ matrix.outdir }}/sumi.app dist/sumi-mac-${{ matrix.arch }}.zip
+
+      # 自动更新校验：产物 sha256 边车（<artifact>.sha256），随 Release 上传
+      - name: Generate checksum
+        run: |
+          f=dist/sumi-mac-${{ matrix.arch }}.zip
+          shasum -a 256 "$f" | cut -d' ' -f1 | tr -d '\n' > "$f.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sumi-macos-${{ matrix.arch }}
+          path: |
+            sumi-app/dist/sumi-mac-${{ matrix.arch }}.zip
+            sumi-app/dist/sumi-mac-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+
+  # 发布汇流：windows + linux + mac 双架构四个构建 job 全并行，各自上传 Artifacts；
+  # 全部成功后由本 job 统一创建/轮转 Release 并附全部资产——「建 Release」只有一个执行者，
+  # 无并发竞争（失败语义为全有或全无：任一构建失败则不发布，不会出现只有部分平台产物的半成品 Release）。
+  # 手动触发只出 Artifacts，本 job 不跑
+  publish:
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    if: >-
+      github.event_name == 'push' &&
+      (startsWith(github.event.head_commit.message, 'release') ||
+       startsWith(github.event.head_commit.message, 'feat') ||
+       startsWith(github.event.head_commit.message, 'fix'))
+    steps:
+      # nightly 轮转要删远端 tag（checkout 默认持久化 token）；发布说明/守卫产物经 job outputs 传递
+      - uses: actions/checkout@v7
+
+      # 三个构建 job 的产物拉平到 dist/（merge-multiple 展平各 artifact 子目录）
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: sumi-*
+          merge-multiple: true
+
+      - name: Nightly meta
+        if: github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'release')
+        id: nightly
+        shell: bash
+        run: echo "sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      # ---- 正式版：release 提交（tag+Release 由 action-gh-release 的 tag_name 在当前 commit 创建）----
+
+      - name: Create Release
+        if: github.event_name == 'push' && startsWith(github.event.head_commit.message, 'release')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.windows.outputs.release_tag }}
+          name: ${{ needs.windows.outputs.release_tag }}
+          body: ${{ needs.windows.outputs.release_body }}
+          files: |
+            dist/sumi-windows-x64.zip
+            dist/sumi-windows-x64.zip.sha256
+            dist/sumi-mac-arm64.zip
+            dist/sumi-mac-arm64.zip.sha256
+            dist/sumi-mac-x64.zip
+            dist/sumi-mac-x64.zip.sha256
+            dist/sumi-linux-x64.AppImage
+            dist/sumi-linux-x64.AppImage.sha256
+
+      # ---- nightly：main 分支 feat/fix 提交（滚动覆盖）----
+
+      - name: Rotate nightly release
+        if: github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'release')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag || true
+          git push origin --delete refs/tags/nightly || true
+
+      - name: Create Nightly Release
+        if: github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'release')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          name: Nightly ${{ steps.nightly.outputs.sha }}
+          # body 末尾注入完整 sha（HTML 注释，用户不可见）：客户端自动更新比较 nightly 新旧用
+          # （release 的 target_commitish 是分支名不是 sha，不能用作比较）
+          body: |
+            ${{ github.event.head_commit.message }}
+
+            <!-- sumi-nightly-sha: ${{ github.sha }} -->
+          prerelease: true
+          files: |
+            dist/sumi-windows-x64.zip
+            dist/sumi-windows-x64.zip.sha256
+            dist/sumi-mac-arm64.zip
+            dist/sumi-mac-arm64.zip.sha256
+            dist/sumi-mac-x64.zip
+            dist/sumi-mac-x64.zip.sha256
+            dist/sumi-linux-x64.AppImage
+            dist/sumi-linux-x64.AppImage.sha256

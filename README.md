@@ -91,4 +91,4 @@ POST http://localhost:27381/api/v1/item/update
 
 ## 许可证
 
-待定（hawk 为 AGPL-3.0）。
+AGPL-3.0-only（与 hawk 一致）。

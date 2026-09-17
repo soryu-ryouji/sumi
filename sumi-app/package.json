@@ -15,8 +15,10 @@
     "build": "vue-tsc --noEmit -p web/tsconfig.json && tsc --noEmit -p electron/tsconfig.json && vite build",
     "build:electron": "node scripts/build-electron.mjs",
     "build:server": "node scripts/build-server.mjs",
-    "pack": "npm run build && npm run build:electron && npm run build:server && node scripts/pack.mjs",
-    "pack:dir": "npm run build && npm run build:electron && npm run build:server && node scripts/pack.mjs --dir"
+    "build:update": "node scripts/build-update.mjs",
+    "stamp:build": "node scripts/stamp-build.mjs",
+    "pack": "npm run build && npm run build:electron && npm run build:server && npm run build:update && node scripts/pack.mjs",
+    "pack:dir": "npm run build && npm run build:electron && npm run build:server && npm run build:update && node scripts/pack.mjs --dir"
   },
   "dependencies": {
     "@vueuse/core": "^14.4.0",

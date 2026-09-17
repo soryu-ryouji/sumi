@@ -55,4 +55,4 @@ export const SSE_EVENTS = [
 ] as const;
 export type SseEventName = (typeof SSE_EVENTS)[number];
 
-export { type SumiShell, type ServerConn, type ServerProgress, type LibraryList, type LibraryHistoryItem } from '../../../../electron/src/ipc-contract';
+export { type SumiShell, type ServerConn, type ServerProgress, type LibraryList, type LibraryHistoryItem, type UpdateChannel, type UpdateInfo, type UpdateProgress, UPDATE_CANCELLED } from '../../../../electron/src/ipc-contract';
