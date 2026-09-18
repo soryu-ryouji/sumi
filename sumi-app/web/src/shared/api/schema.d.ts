@@ -1227,6 +1227,8 @@ export interface components {
         };
         LibraryInfo: {
             application_version: string;
+            /** @description 保存时自动回写 EPUB/PDF 文件元数据（.sumi/config.toml 的 embed_metadata） */
+            embed_metadata: boolean;
             /** Format: int64 */
             modification_time: number;
             name: string;
@@ -1239,6 +1241,8 @@ export interface components {
             storage_mode: string;
         };
         LibraryPatchBody: {
+            /** @description 保存时自动回写 EPUB/PDF 文件元数据（缺省不修改） */
+            embed_metadata?: boolean | null;
             /** @description 书库显示名（缺省不修改；空串表示清除） */
             name?: string | null;
             /** @description 打开方式整体替换（缺省不修改）：扩展名 → 应用；空 map 表示全部清除 */

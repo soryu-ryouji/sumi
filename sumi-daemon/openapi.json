@@ -2223,11 +2223,16 @@
           "application_version",
           "storage_mode",
           "scan",
-          "openers"
+          "openers",
+          "embed_metadata"
         ],
         "properties": {
           "application_version": {
             "type": "string"
+          },
+          "embed_metadata": {
+            "type": "boolean",
+            "description": "保存时自动回写 EPUB/PDF 文件元数据（.sumi/config.toml 的 embed_metadata）"
           },
           "modification_time": {
             "type": "integer",
@@ -2260,6 +2265,13 @@
       "LibraryPatchBody": {
         "type": "object",
         "properties": {
+          "embed_metadata": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "保存时自动回写 EPUB/PDF 文件元数据（缺省不修改）"
+          },
           "name": {
             "type": [
               "string",

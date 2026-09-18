@@ -54,7 +54,7 @@ impl Default for ScanConfig {
 }
 
 /// config.toml 的内存快照
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LibraryConfigSnapshot {
     pub name: Option<String>,
     pub ignore: Vec<String>,
@@ -65,6 +65,22 @@ pub struct LibraryConfigSnapshot {
     pub openers: std::collections::HashMap<String, String>,
     pub scan: ScanConfig,
     pub web: WebConfig,
+    /// 保存时自动回写 EPUB/PDF 文件元数据（缺省开启；不能用 derive Default —— bool 默认 false）
+    pub embed_metadata: bool,
+}
+
+impl Default for LibraryConfigSnapshot {
+    fn default() -> Self {
+        LibraryConfigSnapshot {
+            name: None,
+            ignore: Vec::new(),
+            extensions: None,
+            openers: std::collections::HashMap::new(),
+            scan: ScanConfig::default(),
+            web: WebConfig::default(),
+            embed_metadata: true,
+        }
+    }
 }
 
 impl LibraryConfigSnapshot {
@@ -129,6 +145,9 @@ ignore = []
 # pdf = "/Applications/Adobe Acrobat Reader.app"
 # epub = "Calibre"
 
+# 保存时自动回写 EPUB/PDF 文件元数据（书名/作者/封面等写进原文件；网盘同步场景可关）
+# embed_metadata = true
+
 # 周期兜底重扫（监听漏事件的最终一致保证）
 [scan]
 periodic = true
@@ -159,6 +178,8 @@ struct RawConfig {
     scan: RawScan,
     #[serde(default)]
     web: RawWeb,
+    #[serde(default = "default_true")]
+    embed_metadata: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -275,6 +296,7 @@ impl LibraryConfig {
             openers,
             scan,
             web,
+            embed_metadata: raw.embed_metadata,
         })
     }
 
@@ -346,6 +368,22 @@ mod tests {
         assert_eq!(raw.scan.interval, 900);
         assert!(!raw.web.enabled);
         assert_eq!(raw.web.port, 27382);
+    }
+
+    #[test]
+    fn embed_metadata_config_roundtrip() {
+        // 缺省开启；显式关闭经 edit 持久化后仍生效
+        let dir = std::env::temp_dir().join(format!("sumi-embed-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let cfg = LibraryConfig::load(path.to_str().unwrap());
+        assert!(cfg.current().embed_metadata, "缺省应开启");
+        cfg.edit(|doc| {
+            doc["embed_metadata"] = toml_edit::value(false);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!cfg.current().embed_metadata, "关闭应持久化");
     }
 
     #[test]

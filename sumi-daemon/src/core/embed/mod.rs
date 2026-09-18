@@ -16,6 +16,18 @@ pub struct EmbedFailure {
     pub error: String,
 }
 
+/// 封面回写方案（由 API 层按触发点计算）：
+/// - Keep：普通元数据更新且无封面可写——绝不动文件内既有封面（不剥离别人嵌入的封面）
+/// - Embed：写入 PNG 字节（替换既有封面条目或新增）
+/// - Remove：封面删除且无回退源——移除 OPF 封面引用；图片条目保留包内
+///   （可能被封面页 xhtml 引用，删文件会破坏内容）
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbedCover {
+    Keep,
+    Embed(Vec<u8>),
+    Remove,
+}
+
 /// 该路径是否为可回写格式（epub/pdf 之外不写：txt 无内嵌元数据、mobi 写坏风险高）
 pub fn embeddable_ext(rel: &str) -> bool {
     matches!(LibraryPaths::ext_of(rel).as_str(), "epub" | "pdf")
@@ -30,8 +42,8 @@ pub fn has_embeddable_path(item: &ItemCore) -> bool {
 
 /// 对 item 的全部库内路径回写元数据。
 /// 同内容多路径必须全部写入：只写主路径会让副本哈希分叉、被扫描器拆成两个 item。
-/// 单路径失败不影响其它路径；返回失败列表。cover_png 为处理好的 PNG 字节（None = 不动封面）。
-pub fn embed_metadata(paths: &LibraryPaths, item: &ItemCore, cover_png: Option<&[u8]>) -> Vec<EmbedFailure> {
+/// 单路径失败不影响其它路径；返回失败列表。cover 为三态封面方案（见 EmbedCover）。
+pub fn embed_metadata(paths: &LibraryPaths, item: &ItemCore, cover: &EmbedCover) -> Vec<EmbedFailure> {
     let mut failures = Vec::new();
     for record in &item.paths {
         let rel = &record.path;
@@ -43,7 +55,7 @@ pub fn embed_metadata(paths: &LibraryPaths, item: &ItemCore, cover_png: Option<&
             continue;
         };
         let result = match LibraryPaths::ext_of(rel).as_str() {
-            "epub" => epub::write_epub_metadata(&abs, item, cover_png),
+            "epub" => epub::write_epub_metadata(&abs, item, cover),
             "pdf" => pdf::write_pdf_metadata(&abs, item),
             _ => continue,
         };
@@ -112,7 +124,7 @@ mod tests {
         let rel2 = write_fixture(tag, "sub/b.epub", &bytes);
         let item = item_with(&[&rel1, &rel2]);
 
-        let failures = embed_metadata(&paths, &item, Some(&fake_png(1)));
+        let failures = embed_metadata(&paths, &item, &EmbedCover::Embed(fake_png(1)));
         assert!(failures.is_empty(), "失败: {failures:?}");
 
         // 两个副本都被改写且内容一致（同内容多路径语义）
@@ -130,7 +142,7 @@ mod tests {
         let paths = root_for(tag);
         // txt 跳过（文件不存在也不报错）；epub 缺失文件 → 失败记录
         let item = item_with(&["books/x.txt", "books/missing.epub"]);
-        let failures = embed_metadata(&paths, &item, None);
+        let failures = embed_metadata(&paths, &item, &EmbedCover::Keep);
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].path, "books/missing.epub");
     }
@@ -141,7 +153,7 @@ mod tests {
         let paths = root_for(tag);
         let rel = write_fixture(tag, "doc.pdf", super::pdf::tests::MINIMAL_PDF);
         let item = item_with(&[&rel]);
-        let failures = embed_metadata(&paths, &item, None);
+        let failures = embed_metadata(&paths, &item, &EmbedCover::Keep);
         assert!(failures.is_empty(), "失败: {failures:?}");
         super::pdf::tests::assert_info_fields(&paths.to_absolute(&rel).unwrap(), &item);
     }

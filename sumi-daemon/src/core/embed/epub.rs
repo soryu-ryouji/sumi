@@ -1,15 +1,23 @@
 //! EPUB 元数据回写：改写 OPF metadata（dc:* 覆盖式更新 + EPUB3 标准系列字段）与封面条目。
 //! 结构选择：不整体重建 OPF，而是流式变换——受管元素（dc:title/creator/publisher/description/subject、
-//! 自写的系列 meta、封面 meta）整块吞掉后在 metadata/manifest 开始处统一注入，
+//! 系列与封面相关 meta）整块吞掉后在 metadata/manifest 开始处统一注入，
 //! 其余元素（日期/标识符/语言/refines/手稿结构）逐事件原样保留，最大限度不破坏外部制作器数据。
 //! zip 重写遵循 OCF：mimetype 必须是首条目且 Stored 不压缩；未涉及条目字节原样保留。
 //!
 //! 字段映射（库 → OPF）：title→dc:title、authors→dc:creator×N、publisher→dc:publisher、
 //! description→dc:description、tags+categories→dc:subject×N（合并去重）、
 //! series→belongs-to-collection + collection-type=series + group-position（EPUB 3 规范 vocab，
-//! 仅 version="3.x" 包写入；EPUB 2 无标准系列字段，不写）；系列非空时同时移除 calibre:series*
-//! 旧约定 meta（解析端 calibre 优先，不移除会读到陈旧值），系列为空时不动任何既有 meta。
+//! 仅 version="3.x" 包写入；EPUB 2 无标准系列字段，不写）。
+//! calibre:series* 私有约定 meta 无论系列是否非空一律移除——残留会在重新导入时经
+//! 解析端 calibre 优先读到陈旧值（旧系列「复活」）；系列清空时同步移除自写的
+//! sumi-series 系列 meta，使文件与库状态一致。
+//!
+//! 封面三态（见 EmbedCover）：Embed 替换既有封面条目（非 .png 条目改名同目录同 stem
+//! 的 .png，撞名加数字后缀）或新增 sumi_cover.png（撞名探号）；Remove 移除 OPF 封面
+//! 引用（meta name=cover 与 manifest cover-image 标记），图片文件条目保留包内
+//! （可能被封面页 xhtml 引用，删文件会破坏内容）；Keep 不动既有封面。
 
+use super::EmbedCover;
 use crate::core::item::ItemCore;
 use crate::core::parser::epub::{join_href, locate_opf, parse_opf};
 use quick_xml::escape::escape;
@@ -23,8 +31,22 @@ const SERIES_ID: &str = "sumi-series";
 const COVER_ITEM_ID: &str = "sumi-cover";
 const COVER_HREF: &str = "sumi_cover.png";
 
-/// 回写 EPUB 元数据。cover_png 有值时替换/新增封面条目（字节为 PNG）；None 时封面原样保留。
-pub fn write_epub_metadata(abs_path: &str, item: &ItemCore, cover_png: Option<&[u8]>) -> Result<(), String> {
+/// OPF 变换的封面上下文（Keep = None；Embed/Remove 各带参数）
+struct CoverCtx {
+    /// Remove 模式：剥 manifest item 的 cover-image 标记（Embed 模式为 false）
+    strip: bool,
+    /// Embed：封面目标 manifest item id（替换既有条目）
+    target_id: Option<String>,
+    /// Embed：改名后的 href 属性值（None = 原 href 不变）
+    new_href: Option<String>,
+    /// Embed：新增封面 item 时的 href（Some = 包内无封面声明，manifest 处注入新 item）
+    new_item_href: Option<String>,
+    /// Embed：注入 meta name=cover 的 content 值（指向 manifest id）
+    meta_ref: String,
+}
+
+/// 回写 EPUB 元数据。cover 为三态封面方案（Embed 字节为 PNG）。
+pub(crate) fn write_epub_metadata(abs_path: &str, item: &ItemCore, cover: &EmbedCover) -> Result<(), String> {
     let bytes = std::fs::read(abs_path).map_err(|e| format!("读取失败: {e}"))?;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))
         .map_err(|e| format!("zip 打开失败: {e}"))?;
@@ -37,27 +59,90 @@ pub fn write_epub_metadata(abs_path: &str, item: &ItemCore, cover_png: Option<&[
     };
     let opf = parse_opf(&opf_xml);
 
-    // 封面方案：已有声明（EPUB3 properties / item name / meta content 三源合并结果）→ 替换该条目字节；
-    // 无声明 → 新增 sumi_cover.png 条目 + manifest item，meta name=cover 与 properties 双写兼容两种版本
-    let cover_meta_ref = if cover_png.is_some() {
-        opf.cover_item_id.clone().unwrap_or_else(|| COVER_ITEM_ID.to_string())
-    } else {
-        String::new()
+    // href → zip 条目路径（与解析端同口径：percent 解码 + 归一化）
+    let zip_of = |href: &str| join_href(&opf_dir, href);
+    // 包内既有条目名集合（封面改名 / 新增条目的撞名探测）
+    let taken: std::collections::HashSet<String> = (0..archive.len())
+        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+        .collect();
+
+    let cover_ctx: Option<CoverCtx> = match cover {
+        EmbedCover::Keep => None,
+        EmbedCover::Remove => Some(CoverCtx {
+            strip: true,
+            target_id: None,
+            new_href: None,
+            new_item_href: None,
+            meta_ref: String::new(),
+        }),
+        EmbedCover::Embed(_) => match opf.cover_item_id.clone() {
+            Some(id) => {
+                let old_href = opf
+                    .manifest
+                    .iter()
+                    .find(|i| i.id == id)
+                    .map(|i| i.href.clone())
+                    .unwrap_or_else(|| COVER_HREF.to_string());
+                // 非 .png 封面条目改名（同目录同 stem）；候选与包内既有条目撞名时加数字后缀
+                let new_href = png_href(&old_href).map(|cand| {
+                    let dir = cand.rsplit_once('/').map(|(d, _)| d);
+                    let stem = cand
+                        .rsplit('/')
+                        .next()
+                        .and_then(|f| f.rsplit_once('.'))
+                        .map(|(s, _)| s)
+                        .unwrap_or("cover");
+                    probe_free_name(dir, stem, |name| taken.contains(&zip_of(name)))
+                });
+                Some(CoverCtx {
+                    strip: false,
+                    target_id: Some(id.clone()),
+                    new_href,
+                    new_item_href: None,
+                    meta_ref: id,
+                })
+            }
+            None => {
+                // 无封面声明：新增条目（sumi_cover.png 已存在 → sumi_cover2.png… 探号到不撞）
+                let href = probe_free_name(None, "sumi_cover", |name| taken.contains(&zip_of(name)));
+                Some(CoverCtx {
+                    strip: false,
+                    target_id: None,
+                    new_href: None,
+                    new_item_href: Some(href),
+                    meta_ref: COVER_ITEM_ID.to_string(),
+                })
+            }
+        },
     };
-    let cover_is_new = cover_png.is_some() && opf.cover_item_id.is_none();
-    let cover_entry = cover_png.map(|_| match &opf.cover_item_id {
-        Some(id) => opf
-            .manifest
-            .iter()
-            .find(|i| &i.id == id)
-            .map(|i| join_href(&opf_dir, &i.href))
-            .unwrap_or_else(|| join_href(&opf_dir, COVER_HREF)),
-        None => join_href(&opf_dir, COVER_HREF),
-    });
 
-    let new_opf = rewrite_opf(&opf_xml, &opf, item, cover_png.is_some(), &cover_meta_ref, cover_is_new)?;
+    // zip 层写入方案：(旧条目, 新条目) —— 原位替换两者同名；改名/新增时旧跳过、新循环后写入
+    let cover_entry: Option<(Option<String>, String)> = match (&cover_ctx, cover) {
+        (Some(ctx), EmbedCover::Embed(_)) if !ctx.strip => {
+            if let Some(id) = &ctx.target_id {
+                let old = opf
+                    .manifest
+                    .iter()
+                    .find(|i| &i.id == id)
+                    .map(|i| zip_of(&i.href))
+                    .unwrap_or_else(|| zip_of(COVER_HREF));
+                let new = ctx.new_href.as_ref().map(|h| zip_of(h)).unwrap_or_else(|| old.clone());
+                Some((Some(old), new))
+            } else {
+                let href = ctx.new_item_href.as_deref().unwrap_or(COVER_HREF);
+                Some((None, zip_of(href)))
+            }
+        }
+        _ => None,
+    };
+    let png_bytes = match cover {
+        EmbedCover::Embed(b) => b.as_slice(),
+        _ => &[] as &[u8],
+    };
 
-    // 重写 zip：mimetype 首条目 Stored；其余 deflate；OPF 与封面条目换新字节
+    let new_opf = rewrite_opf(&opf_xml, &opf, item, cover_ctx.as_ref())?;
+
+    // 重写 zip：mimetype 首条目 Stored；其余 deflate；OPF 换新字节；封面条目按方案处理
     let mut out = Vec::new();
     {
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
@@ -76,9 +161,12 @@ pub fn write_epub_metadata(abs_path: &str, item: &ItemCore, cover_png: Option<&[
                 std::io::Write::write_all(&mut w, &new_opf).map_err(zip_err)?;
                 continue;
             }
-            if !cover_is_new && cover_entry.as_deref() == Some(name.as_str()) {
-                w.start_file(&name, deflated).map_err(zip_err)?;
-                std::io::Write::write_all(&mut w, cover_png.unwrap_or(&[])).map_err(zip_err)?;
+            if cover_entry.as_ref().and_then(|(o, _)| o.as_deref()) == Some(name.as_str()) {
+                // 原位替换：同名写新字节；改名：旧条目跳过（新名循环后另写）
+                if cover_entry.as_ref().map(|(_, n)| n.as_str()) == Some(name.as_str()) {
+                    w.start_file(&name, deflated).map_err(zip_err)?;
+                    std::io::Write::write_all(&mut w, png_bytes).map_err(zip_err)?;
+                }
                 continue;
             }
             if f.is_dir() {
@@ -88,10 +176,11 @@ pub fn write_epub_metadata(abs_path: &str, item: &ItemCore, cover_png: Option<&[
             w.start_file(&name, deflated).map_err(zip_err)?;
             std::io::copy(&mut f, &mut w).map_err(zip_err)?;
         }
-        if cover_is_new {
-            if let Some(entry) = &cover_entry {
-                w.start_file(entry, deflated).map_err(zip_err)?;
-                std::io::Write::write_all(&mut w, cover_png.unwrap_or(&[])).map_err(zip_err)?;
+        // 改名 / 新增条目：旧条目路径不等于新条目路径时在此写入
+        if let Some((old, new)) = &cover_entry {
+            if old.as_deref() != Some(new.as_str()) {
+                w.start_file(new, deflated).map_err(zip_err)?;
+                std::io::Write::write_all(&mut w, png_bytes).map_err(zip_err)?;
             }
         }
         w.finish().map_err(zip_err)?;
@@ -105,14 +194,7 @@ fn zip_err(e: impl Into<std::io::Error>) -> String {
 }
 
 /// OPF 流式改写。受管元素吞掉不写，注入发生在 metadata / manifest 开始标签之后。
-fn rewrite_opf(
-    opf_xml: &str,
-    opf: &crate::core::parser::epub::Opf,
-    item: &ItemCore,
-    rewrite_cover: bool,
-    cover_meta_ref: &str,
-    cover_is_new: bool,
-) -> Result<Vec<u8>, String> {
+fn rewrite_opf(opf_xml: &str, _opf: &crate::core::parser::epub::Opf, item: &ItemCore, cover_ctx: Option<&CoverCtx>) -> Result<Vec<u8>, String> {
     // BOM 剥离（quick-xml 对 &str 输入的 BOM 容忍度不确定，输出统一无 BOM）
     let opf_xml = opf_xml.strip_prefix('\u{feff}').unwrap_or(opf_xml);
     let mut reader = Reader::from_str(opf_xml);
@@ -123,8 +205,9 @@ fn rewrite_opf(
     let mut epub3 = false;
     // 子树跳过深度（受管元素整块吞掉；Enter +1 / End -1，归零时对应的 End 也吞）
     let mut skip_depth = 0usize;
-    // 封面替换目标 manifest id（仅替换已存在条目时非空）
-    let cover_target = if rewrite_cover { opf.cover_item_id.clone() } else { None };
+    // Embed 模式（注入 meta name=cover / 改写目标条目）；Remove 模式只刻 strip
+    let embed_cover = matches!(cover_ctx, Some(c) if !c.strip);
+    let cover_meta_ref = cover_ctx.map(|c| c.meta_ref.clone()).unwrap_or_default();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -145,25 +228,39 @@ fn rewrite_opf(
                         "metadata" => {
                             section = 1;
                             writer.write_event(ev).map_err(io_err)?;
-                            for inj in inject_metadata(item, epub3, rewrite_cover, cover_meta_ref) {
+                            for inj in inject_metadata(item, epub3, embed_cover, &cover_meta_ref) {
                                 writer.write_event(inj).map_err(io_err)?;
                             }
                         }
                         "manifest" => {
                             section = 2;
                             writer.write_event(ev).map_err(io_err)?;
-                            if cover_is_new {
-                                writer.write_event(new_cover_item()).map_err(io_err)?;
+                            if let Some(href) = cover_ctx.and_then(|c| c.new_item_href.as_deref()) {
+                                writer.write_event(new_cover_item(href)).map_err(io_err)?;
                             }
                         }
                         _ => {
                             if section == 1 && skip_depth == 0 && managed_dc(&name) {
                                 skip_depth = 1;
-                            } else if section == 1 && skip_depth == 0 && managed_meta(e, item, epub3, rewrite_cover) {
+                            } else if section == 1 && skip_depth == 0 && managed_meta(e, cover_ctx.is_some()) {
                                 skip_depth = 1;
-                            } else if section == 2 && skip_depth == 0 && is_cover_item(e, &cover_target) {
-                                // 封面条目原位改写：字节已换 PNG，媒体类型同步改；properties 补 cover-image
-                                writer.write_event(Event::Start(rebuild_cover_item(e))).map_err(io_err)?;
+                            } else if section == 2 && skip_depth == 0 {
+                                if let Some(ctx) = cover_ctx {
+                                    let replaced = if ctx.strip {
+                                        is_marked_cover_item(e).then(|| Event::Start(strip_cover_item(e)))
+                                    } else {
+                                        is_cover_item(e, &ctx.target_id)
+                                            .then(|| Event::Start(rebuild_cover_item(e, ctx.new_href.as_deref())))
+                                    };
+                                    match replaced {
+                                        Some(out) => writer.write_event(out).map_err(io_err)?,
+                                        None => writer.write_event(ev).map_err(io_err)?,
+                                    }
+                                } else if skip_depth > 0 {
+                                    skip_depth += 1;
+                                } else {
+                                    writer.write_event(ev).map_err(io_err)?;
+                                }
                             } else if skip_depth > 0 {
                                 skip_depth += 1;
                             } else {
@@ -174,14 +271,24 @@ fn rewrite_opf(
                 }
                 Event::Empty(e) => {
                     let name = local_name(e.name().as_ref());
-                    let managed = section == 1
-                        && skip_depth == 0
-                        && (managed_dc(&name) || managed_meta(e, item, epub3, rewrite_cover));
-                    let cover_item = section == 2 && skip_depth == 0 && is_cover_item(e, &cover_target);
+                    let managed =
+                        section == 1 && skip_depth == 0 && (managed_dc(&name) || managed_meta(e, cover_ctx.is_some()));
+                    let cover_item: Option<Event<'static>> = if section == 2 && skip_depth == 0 {
+                        match cover_ctx {
+                            Some(ctx) if ctx.strip => {
+                                is_marked_cover_item(e).then(|| Event::Empty(strip_cover_item(e)))
+                            }
+                            Some(ctx) => is_cover_item(e, &ctx.target_id)
+                                .then(|| Event::Empty(rebuild_cover_item(e, ctx.new_href.as_deref()))),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
                     if managed {
                         // 自闭合受管元素：吞掉即可，无子深度
-                    } else if cover_item {
-                        writer.write_event(Event::Empty(rebuild_cover_item(e))).map_err(io_err)?;
+                    } else if let Some(out) = cover_item {
+                        writer.write_event(out).map_err(io_err)?;
                     } else if skip_depth == 0 {
                         writer.write_event(ev).map_err(io_err)?;
                     }
@@ -225,9 +332,9 @@ fn managed_dc(name: &str) -> bool {
 }
 
 /// 受管 meta 元素：自写的 EPUB3 系列 meta（按 id/refines 识别，外部集合不动）、
-/// EPUB3 包且系列非空时的 calibre:series*（解析端 calibre 优先，不移除会读到陈旧值；
-/// EPUB2 无标准替代字段，保留不动）、重写封面时的 meta name=cover（注入统一指到目标条目）
-fn managed_meta(e: &BytesStart, item: &ItemCore, epub3: bool, rewrite_cover: bool) -> bool {
+/// calibre:series*（私有约定，无论 EPUB2/3、系列是否非空一律移除——残留会在重新导入时
+/// 经解析端 calibre 优先复活旧系列）、封面 meta（Embed 重指目标条目 / Remove 剥除）
+fn managed_meta(e: &BytesStart, cover_touched: bool) -> bool {
     let mut name = String::new();
     let mut property = String::new();
     let mut id = String::new();
@@ -245,10 +352,10 @@ fn managed_meta(e: &BytesStart, item: &ItemCore, epub3: bool, rewrite_cover: boo
         return (property == "belongs-to-collection" && id == SERIES_ID)
             || (refines == format!("#{SERIES_ID}") && matches!(property.as_str(), "collection-type" | "group-position"));
     }
-    if epub3 && !item.series.is_empty() && (name == "calibre:series" || name == "calibre:series_index") {
+    if name == "calibre:series" || name == "calibre:series_index" {
         return true;
     }
-    rewrite_cover && name == "cover"
+    cover_touched && name == "cover"
 }
 
 /// 封面替换目标命中判断
@@ -260,9 +367,40 @@ fn is_cover_item(e: &BytesStart, cover_target: &Option<String>) -> bool {
     e.attributes().flatten().any(|a| a.key.as_ref() == b"id" && a.value.as_ref() == target.as_bytes())
 }
 
-/// 封面 manifest item 原位改写：保留 id/href 与其余属性，media-type 改 image/png，
-/// properties 并入 cover-image（属性值保持源码转义态原样透传，不做反转义）
-fn rebuild_cover_item(e: &BytesStart) -> BytesStart<'static> {
+/// Remove 模式命中判断：manifest item 的 properties 含 cover-image 标记
+fn is_marked_cover_item(e: &BytesStart) -> bool {
+    local_name(e.name().as_ref()) == "item"
+        && e.attributes().flatten().any(|a| {
+            a.key.as_ref() == b"properties"
+                && String::from_utf8_lossy(&a.value).split_whitespace().any(|p| p == "cover-image")
+        })
+}
+
+/// Remove 模式的封面条目改写：剥掉 cover-image 标记，其余属性（含 href/media-type）原样保留；
+/// 图片文件条目本身留在包内（可能被封面页 xhtml 引用）
+fn strip_cover_item(e: &BytesStart) -> BytesStart<'static> {
+    let mut out = BytesStart::new("item");
+    for attr in e.attributes().flatten() {
+        let key = attr.key.as_ref().to_vec();
+        if key == b"properties" {
+            let owned = String::from_utf8_lossy(&attr.value).into_owned();
+            let kept: Vec<&str> = owned.split_whitespace().filter(|p| *p != "cover-image").collect();
+            if !kept.is_empty() {
+                out.push_attribute(("properties", kept.join(" ").as_str()));
+            }
+            continue;
+        }
+        out.push_attribute((
+            std::str::from_utf8(&key).unwrap_or(""),
+            std::str::from_utf8(&attr.value).unwrap_or(""),
+        ));
+    }
+    out
+}
+
+/// 封面 manifest item 原位改写：保留 id 与其余属性，media-type 改 image/png，
+/// properties 并入 cover-image；href 可选改名（替换非 .png 条目时同步新扩展名）
+fn rebuild_cover_item(e: &BytesStart, new_href: Option<&str>) -> BytesStart<'static> {
     let mut id = String::new();
     let mut href = String::new();
     let mut properties = String::new();
@@ -277,6 +415,9 @@ fn rebuild_cover_item(e: &BytesStart) -> BytesStart<'static> {
             b"properties" => properties = String::from_utf8_lossy(&value).into_owned(),
             _ => others.push((key, value)),
         }
+    }
+    if let Some(h) = new_href {
+        href = h.to_string();
     }
     let mut props: Vec<String> = properties.split_whitespace().map(|s| s.to_string()).collect();
     if !props.iter().any(|p| p == "cover-image") {
@@ -296,12 +437,46 @@ fn rebuild_cover_item(e: &BytesStart) -> BytesStart<'static> {
     out
 }
 
-/// 新增封面条目的 manifest item（EPUB2/3 双兼容的 properties 写法）
-fn new_cover_item() -> Event<'static> {
+/// href 文件名部分换 .png 扩展名（目录部分原样保留）；已 .png 结尾返回 None = 无需改名
+fn png_href(href: &str) -> Option<String> {
+    let (dir, file) = match href.rsplit_once('/') {
+        Some((d, f)) => (Some(d), f),
+        None => (None, href),
+    };
+    if file.to_ascii_lowercase().ends_with(".png") {
+        return None;
+    }
+    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+    let new_file = format!("{stem}.png");
+    Some(match dir {
+        Some(d) => format!("{d}/{new_file}"),
+        None => new_file,
+    })
+}
+
+/// 目录内探测不撞名的文件名（stem.png → stem2.png → …）；is_taken 收全路径判定，
+/// 返回带目录前缀的相对 href（新增封面条目撞名与封面改名撞名共用）
+fn probe_free_name(dir: Option<&str>, stem: &str, is_taken: impl Fn(&str) -> bool) -> String {
+    let mut i = 1u32;
+    loop {
+        let file = if i == 1 { format!("{stem}.png") } else { format!("{stem}{i}.png") };
+        let full = match dir {
+            Some(d) => format!("{d}/{file}"),
+            None => file,
+        };
+        if !is_taken(&full) {
+            return full;
+        }
+        i += 1;
+    }
+}
+
+/// 新增封面条目的 manifest item（EPUB2/3 双兼容的 properties 写法；href 为探号后的最终值）
+fn new_cover_item(href: &str) -> Event<'static> {
     Event::Empty(
         BytesStart::new("item").with_attributes([
             ("id", COVER_ITEM_ID),
-            ("href", COVER_HREF),
+            ("href", href),
             ("media-type", "image/png"),
             ("properties", "cover-image"),
         ]),
@@ -487,9 +662,9 @@ pub(crate) mod tests {
         assert_eq!(parsed.book.cover.unwrap(), vec![0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01]);
     }
 
-    /// EPUB2 包：系列不写（无标准字段），calibre meta 原样保留
+    /// EPUB2 包：无标准系列字段不写系列，calibre 私有 meta 同口径移除（残留会复活旧系列）
     #[test]
-    fn epub2_series_not_written() {
+    fn epub2_series_not_written_and_calibre_removed() {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut zip = zip::ZipWriter::new(&mut buf);
@@ -517,9 +692,10 @@ pub(crate) mod tests {
 
         let mut item = crate::core::item::ItemCore::new("h", vec![], 0);
         item.title = "V2 新标题".into();
-        item.series = "不应写入".into();
-        item.series_index = 1.0;
-        write_epub_metadata(abs.to_str().unwrap(), &item, None).unwrap();
+        // 清空系列：文件内 calibre 残留同步擦除（EPUB2/3 同口径）
+        item.series = "".into();
+        item.series_index = 0.0;
+        write_epub_metadata(abs.to_str().unwrap(), &item, &EmbedCover::Keep).unwrap();
 
         let out = std::fs::read(&abs).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&out[..])).unwrap();
@@ -527,7 +703,236 @@ pub(crate) mod tests {
         archive.by_name("content.opf").unwrap().read_to_string(&mut opf).unwrap();
         assert!(opf.contains("V2 新标题"));
         assert!(!opf.contains("belongs-to-collection"), "EPUB2 包不写系列");
-        assert!(opf.contains("保留"), "EPUB2 的 calibre 系列 meta 原样保留");
+        assert!(!opf.contains("calibre:series"), "EPUB2 包的 calibre 系列 meta 也应移除");
+        let parsed = crate::core::parser::epub::parse_epub("x", &out).unwrap();
+        assert_eq!(parsed.book.series, "");
+    }
+
+    /// 清空系列：EPUB3 的 sumi-series 注入元素与 calibre 私有 meta 全部消失，解析端读不到系列
+    #[test]
+    fn clear_series_removes_all_series_meta() {
+        let dir = std::env::temp_dir().join(format!("sumi-embed-clear-series-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = dir.join("clear.epub");
+        std::fs::write(&abs, build_epub3_fixture()).unwrap();
+
+        let mut item = crate::core::item::ItemCore::new("h", vec![], 0);
+        item.title = "清系列".into();
+        item.series = "".into();
+        item.series_index = 0.0;
+        write_epub_metadata(abs.to_str().unwrap(), &item, &EmbedCover::Keep).unwrap();
+
+        let out = std::fs::read(&abs).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&out[..])).unwrap();
+        let mut opf = String::new();
+        archive.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(!opf.contains("belongs-to-collection"), "sumi-series 应被移除: {opf}");
+        assert!(!opf.contains("sumi-series"));
+        assert!(!opf.contains("calibre:series"), "calibre 残留会复活旧系列");
+        let parsed = crate::core::parser::epub::parse_epub("x", &out).unwrap();
+        assert_eq!(parsed.book.series, "");
+    }
+
+    /// 封面 Remove：meta name=cover 与 cover-image 标记消失，图片条目保留包内，解析端读不到封面
+    #[test]
+    fn remove_cover_strips_references() {
+        let dir = std::env::temp_dir().join(format!("sumi-embed-remove-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = dir.join("rm.epub");
+        std::fs::write(&abs, build_epub3_fixture()).unwrap();
+
+        let mut item = crate::core::item::ItemCore::new("h", vec![], 0);
+        item.title = "删封面".into();
+        write_epub_metadata(abs.to_str().unwrap(), &item, &EmbedCover::Remove).unwrap();
+
+        let out = std::fs::read(&abs).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&out[..])).unwrap();
+        let mut opf = String::new();
+        archive.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(!opf.contains("name=\"cover\""), "meta name=cover 应移除: {opf}");
+        assert!(!opf.contains("cover-image"), "cover-image 标记应剥除");
+        assert!(opf.contains("<item id=\"cover\""), "图片条目本身保留（封面页可能引用）");
+        assert!(archive.by_name("OEBPS/cover.png").is_ok(), "图片文件保留包内");
+        let parsed = crate::core::parser::epub::parse_epub("x", &out).unwrap();
+        assert!(parsed.book.cover.is_none(), "解析端不再读到封面");
+    }
+
+    /// 替换非 .png 封面条目：改名同目录同 stem 的 .png（manifest href 同步）；
+    /// 候选名与包内既有条目撞名时加数字后缀
+    #[test]
+    fn cover_rename_png_with_collision_suffix() {
+        let dir = std::env::temp_dir().join(format!("sumi-embed-rename-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = dir.join("rename.epub");
+        std::fs::write(&abs, build_epub3_fixture_cover_jpg_with_collision()).unwrap();
+
+        let mut item = crate::core::item::ItemCore::new("h", vec![], 0);
+        item.title = "改名".into();
+        write_epub_metadata(abs.to_str().unwrap(), &item, &EmbedCover::Embed(vec![0x89, 0x50, 0x4E, 0x47, 9])).unwrap();
+
+        let out = std::fs::read(&abs).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&out[..])).unwrap();
+        let names: Vec<String> = (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect();
+        assert!(!names.iter().any(|n| n == "OEBPS/cover.jpg"), "旧条目不再保留: {names:?}");
+        assert!(names.iter().any(|n| n == "OEBPS/cover2.png"), "撞名探号落到 cover2.png: {names:?}");
+        // 撞名的无关条目不被覆盖（保持原字节）
+        let unrelated = {
+            let mut f = archive.by_name("OEBPS/cover.png").unwrap();
+            let mut b = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut b).unwrap();
+            b
+        };
+        assert_eq!(unrelated, b"unrelated".to_vec(), "撞名条目不被覆盖");
+        let mut opf = String::new();
+        archive.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(opf.contains("href=\"cover2.png\""), "manifest href 同步改名: {opf}");
+        assert!(!opf.contains("cover.jpg"));
+        let parsed = crate::core::parser::epub::parse_epub("x", &out).unwrap();
+        assert_eq!(parsed.book.cover.unwrap(), vec![0x89, 0x50, 0x4E, 0x47, 9]);
+    }
+
+    /// 子目录封面改名：href 为 images/cover.jpg 时改名应保留目录前缀（images/cover.png），不搬到 OPF 根目录
+    #[test]
+    fn cover_rename_keeps_subdir_prefix() {
+        let dir = std::env::temp_dir().join(format!("sumi-embed-subdir-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = dir.join("sub.epub");
+        std::fs::write(&abs, build_epub3_fixture_cover_subdir()).unwrap();
+
+        let mut item = crate::core::item::ItemCore::new("h", vec![], 0);
+        item.title = "子目录".into();
+        write_epub_metadata(abs.to_str().unwrap(), &item, &EmbedCover::Embed(vec![0x89, 0x50, 0x4E, 0x47, 3])).unwrap();
+
+        let out = std::fs::read(&abs).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&out[..])).unwrap();
+        let names: Vec<String> = (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect();
+        assert!(!names.iter().any(|n| n == "OEBPS/images/cover.jpg"), "旧条目不再保留: {names:?}");
+        assert!(names.iter().any(|n| n == "OEBPS/images/cover.png"), "改名保留目录前缀: {names:?}");
+        assert!(!names.iter().any(|n| n == "OEBPS/cover.png"), "封面不应搬到 OPF 根目录: {names:?}");
+        let mut opf = String::new();
+        archive.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(opf.contains("href=\"images/cover.png\""), "manifest href 同步改名: {opf}");
+        let parsed = crate::core::parser::epub::parse_epub("x", &out).unwrap();
+        assert_eq!(parsed.book.cover.unwrap(), vec![0x89, 0x50, 0x4E, 0x47, 3]);
+    }
+
+    /// 无封面声明的新增：包内已有无关 sumi_cover.png 条目时探号 sumi_cover2.png，不覆盖既有条目
+    #[test]
+    fn new_cover_entry_probes_free_name() {
+        let dir = std::env::temp_dir().join(format!("sumi-embed-new-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = dir.join("new.epub");
+        std::fs::write(&abs, build_epub3_fixture_no_cover_with_stray()).unwrap();
+
+        let mut item = crate::core::item::ItemCore::new("h", vec![], 0);
+        item.title = "新增".into();
+        write_epub_metadata(abs.to_str().unwrap(), &item, &EmbedCover::Embed(vec![0x89, 0x50, 0x4E, 0x47, 7])).unwrap();
+
+        let out = std::fs::read(&abs).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&out[..])).unwrap();
+        // 既有无关条目字节不变（不被覆盖为封面）
+        let stray = {
+            let mut f = archive.by_name("OEBPS/sumi_cover.png").unwrap();
+            let mut b = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut b).unwrap();
+            b
+        };
+        assert_eq!(stray, b"stray".to_vec(), "既有同名条目不被覆盖");
+        assert!(archive.by_name("OEBPS/sumi_cover2.png").is_ok(), "封面探号到 sumi_cover2.png");
+        let mut opf = String::new();
+        archive.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(opf.contains("href=\"sumi_cover2.png\""), "manifest 指向探号后的条目: {opf}");
+        assert!(!opf.contains("href=\"sumi_cover.png\""));
+    }
+
+    /// EPUB3 fixture 变体：封面为 cover.jpg（JPEG media-type）且包内另有无关 cover.png 条目
+    /// （改名候选 cover.png 被占 → 探号 cover2.png；同时验证旧条目不再保留）
+    fn build_epub3_fixture_cover_jpg_with_collision() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("mimetype", opts).unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+            zip.start_file("META-INF/container.xml", opts).unwrap();
+            zip.write_all(r#"<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#.as_bytes()).unwrap();
+            zip.start_file("OEBPS/cover.jpg", opts).unwrap();
+            zip.write_all(b"jpeg-bytes").unwrap();
+            zip.start_file("OEBPS/cover.png", opts).unwrap();
+            zip.write_all(b"unrelated").unwrap();
+            let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>旧标题</dc:title></metadata>
+  <manifest>
+    <item id="cover" href="cover.jpg" media-type="image/jpeg" properties="cover-image"/>
+    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#;
+            zip.start_file("OEBPS/content.opf", opts).unwrap();
+            zip.write_all(opf.as_bytes()).unwrap();
+            zip.start_file("OEBPS/c1.xhtml", opts).unwrap();
+            zip.write_all(r#"<html><body><p>t</p></body></html>"#.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// EPUB3 fixture 变体：封面在子目录（images/cover.jpg），检验改名保留目录前缀
+    fn build_epub3_fixture_cover_subdir() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("mimetype", opts).unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+            zip.start_file("META-INF/container.xml", opts).unwrap();
+            zip.write_all(r#"<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#.as_bytes()).unwrap();
+            zip.start_file("OEBPS/images/cover.jpg", opts).unwrap();
+            zip.write_all(b"jpeg-bytes").unwrap();
+            let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>旧标题</dc:title></metadata>
+  <manifest>
+    <item id="cover" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>
+    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#;
+            zip.start_file("OEBPS/content.opf", opts).unwrap();
+            zip.write_all(opf.as_bytes()).unwrap();
+            zip.start_file("OEBPS/c1.xhtml", opts).unwrap();
+            zip.write_all(r#"<html><body><p>t</p></body></html>"#.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// EPUB3 fixture 变体：无封面声明，包内另有无关 sumi_cover.png 条目（新增封面探号用）
+    fn build_epub3_fixture_no_cover_with_stray() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("mimetype", opts).unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+            zip.start_file("META-INF/container.xml", opts).unwrap();
+            zip.write_all(r#"<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#.as_bytes()).unwrap();
+            zip.start_file("OEBPS/sumi_cover.png", opts).unwrap();
+            zip.write_all(b"stray").unwrap();
+            let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>旧标题</dc:title></metadata>
+  <manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#;
+            zip.start_file("OEBPS/content.opf", opts).unwrap();
+            zip.write_all(opf.as_bytes()).unwrap();
+            zip.start_file("OEBPS/c1.xhtml", opts).unwrap();
+            zip.write_all(r#"<html><body><p>t</p></body></html>"#.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
     }
 
     /// 坏 zip 报错不 panic
@@ -538,6 +943,6 @@ pub(crate) mod tests {
         let abs = dir.join("bad.epub");
         std::fs::write(&abs, b"not a zip").unwrap();
         let item = crate::core::item::ItemCore::new("h", vec![], 0);
-        assert!(write_epub_metadata(abs.to_str().unwrap(), &item, None).is_err());
+        assert!(write_epub_metadata(abs.to_str().unwrap(), &item, &EmbedCover::Keep).is_err());
     }
 }

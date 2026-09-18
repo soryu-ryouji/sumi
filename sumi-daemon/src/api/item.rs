@@ -767,7 +767,7 @@ async fn cover_put(
     let dto = project_item(&state, &updated);
     drop(index);
     state.bus.emit_json(crate::core::events::names::ITEM_UPDATED, &dto);
-    spawn_embed(&state, &updated);
+    spawn_embed(&state, &updated, false);
     Ok(axum::Json(serde_json::json!({ "status": "success", "data": dto })))
 }
 
@@ -801,8 +801,8 @@ async fn cover_delete(
         let dto = project_item(&state, &item);
         drop(index);
         state.bus.emit_json(crate::core::events::names::ITEM_UPDATED, &dto);
-        // 删除自定义封面后回写：文件封面收敛到回退源（派生缓存或不动）
-        spawn_embed(&state, &item);
+        // 删除自定义封面后回写：文件封面收敛到回退源（派生缓存或剥引用）
+        spawn_embed(&state, &item, true);
     }
     Ok(envelope::success())
 }
@@ -813,7 +813,11 @@ fn io_err(e: std::io::Error) -> envelope::ApiError {
 
 /// 保存成功后自动回写 EPUB/PDF 元数据（后台阻塞任务执行；失败仅广播 item.embed_failed，
 /// 不影响保存响应本身）。写回改变文件哈希 → item id 漂移由 watcher 经 migrate_id_drift 收敛。
-fn spawn_embed(state: &SharedState, item: &ItemCore) {
+fn spawn_embed(state: &SharedState, item: &ItemCore, from_cover_delete: bool) {
+    // 自动回写开关（设置「保存时回写文件」；config.toml embed_metadata，缺省开）
+    if !state.config.current().embed_metadata {
+        return;
+    }
     if !crate::core::embed::has_embeddable_path(item) {
         return;
     }
@@ -821,16 +825,18 @@ fn spawn_embed(state: &SharedState, item: &ItemCore) {
     let bus = state.bus.clone();
     let item = item.clone();
     tokio::task::spawn_blocking(move || {
-        let covers_dir = paths.covers_dir.clone();
-        let cache_covers_dir = paths.cache_covers_dir.clone();
-        let id = item.id.clone();
-        // 回写封面：自定义封面优先，回退派生缓存；webp 解码转 PNG（失败按无封面处理，不动文件封面条目）
-        let cover_png = load_embed_cover_png(&covers_dir, &cache_covers_dir, &id);
-        let failures = crate::core::embed::embed_metadata(&paths, &item, cover_png.as_deref());
+        // 封面三态：有封面（自定义优先，回退派生缓存）→ Embed；cover_delete 触发且无
+        // 回退源 → Remove（剥 OPF 封面引用）；其余 → Keep（绝不动既有封面）
+        let cover = match load_embed_cover_png(&paths.covers_dir, &paths.cache_covers_dir, &item.id) {
+            Some(png) => crate::core::embed::EmbedCover::Embed(png),
+            None if from_cover_delete => crate::core::embed::EmbedCover::Remove,
+            None => crate::core::embed::EmbedCover::Keep,
+        };
+        let failures = crate::core::embed::embed_metadata(&paths, &item, &cover);
         if !failures.is_empty() {
             bus.emit_json(
                 crate::core::events::names::ITEM_EMBED_FAILED,
-                &serde_json::json!({ "id": id, "failures": failures }),
+                &serde_json::json!({ "id": item.id, "failures": failures }),
             );
         }
     });
@@ -1247,7 +1253,7 @@ async fn update(
         || body.series.is_some()
         || body.series_index.is_some();
     if embed_touched {
-        spawn_embed(&state, &item);
+        spawn_embed(&state, &item, false);
     }
     Ok(axum::Json(serde_json::json!({ "status": "success", "data": dto })))
 }
@@ -1409,7 +1415,7 @@ async fn batch_update(
         || body.remove_categories.is_some();
     if embed_touched {
         for it in &updated {
-            spawn_embed(&state, it);
+            spawn_embed(&state, it, false);
         }
     }
     Ok(axum::Json(serde_json::json!({

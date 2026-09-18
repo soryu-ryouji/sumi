@@ -367,6 +367,8 @@ struct LibraryInfo {
     scan: ScanInfo,
     /// 打开方式（扩展名 → 指定应用；.sumi/config.toml 的 [openers]）
     openers: std::collections::HashMap<String, String>,
+    /// 保存时自动回写 EPUB/PDF 文件元数据（.sumi/config.toml 的 embed_metadata）
+    embed_metadata: bool,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -388,6 +390,7 @@ fn library_info_data(state: &AppState) -> LibraryInfo {
             interval: config.scan.interval,
         },
         openers: config.openers.clone(),
+        embed_metadata: config.embed_metadata,
     }
 }
 
@@ -407,6 +410,9 @@ struct LibraryPatchBody {
     /// 打开方式整体替换（缺省不修改）：扩展名 → 应用；空 map 表示全部清除
     #[serde(default)]
     openers: Option<std::collections::HashMap<String, String>>,
+    /// 保存时自动回写 EPUB/PDF 文件元数据（缺省不修改）
+    #[serde(default)]
+    embed_metadata: Option<bool>,
 }
 
 /// `PATCH /api/v1/library/info`：改库显示名 / 打开方式（写 config.toml，广播 library.updated）
@@ -435,6 +441,7 @@ async fn library_info_patch(
     }
     let name = body.name.as_deref().map(str::trim);
     let openers = body.openers.clone();
+    let embed_metadata = body.embed_metadata;
     state
         .config
         .edit(|doc| {
@@ -444,6 +451,9 @@ async fn library_info_patch(
                 } else {
                     doc["name"] = toml_edit::value(name);
                 }
+            }
+            if let Some(v) = embed_metadata {
+                doc["embed_metadata"] = toml_edit::value(v);
             }
             if let Some(openers) = &openers {
                 // 整体替换 [openers] 段（保注释的逐键写回）

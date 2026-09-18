@@ -47,11 +47,30 @@ const SIDEBAR_SECTIONS = [
 const libName = ref('');
 const storageMode = ref('database');
 const switching = ref(false);
+/** 保存时回写 EPUB/PDF 文件本身（daemon 持久化；网盘同步场景建议关闭） */
+const embedMetadata = ref(true);
 onMounted(async () => {
-  const info = await api<{ name: string; storage_mode: string }>('/library/info');
+  const info = await api<{ name: string; storage_mode: string; embed_metadata?: boolean }>('/library/info');
   libName.value = info.name;
   storageMode.value = info.storage_mode;
+  // 向后兼容：旧 daemon 无此字段时保持默认开
+  if (typeof info.embed_metadata === 'boolean') {
+    embedMetadata.value = info.embed_metadata;
+  }
 });
+
+/** 勾选即保存（无需显式保存按钮；失败回滚勾选态）。从 DOM 读新值——单向 :checked 绑定下 ref 不随点击变化 */
+async function toggleEmbed(next: boolean): Promise<void> {
+  const prev = embedMetadata.value;
+  embedMetadata.value = next;
+  try {
+    await api('/library/info', { method: 'PATCH', body: { embed_metadata: next } });
+    ui.toast('已保存');
+  } catch (e) {
+    embedMetadata.value = prev;
+    ui.toastError(e);
+  }
+}
 
 async function saveName(): Promise<void> {
   try {
@@ -348,6 +367,8 @@ useEventListener(
                   <option value="toml">配置文件（网盘同步友好）</option>
                 </select>
               </div>
+              <div class="form-row"><span class="form-label">保存时回写文件</span><input type="checkbox" :checked="embedMetadata" :disabled="!conn.writable" @change="toggleEmbed(($event.target as HTMLInputElement).checked)" /></div>
+              <p class="hint">EPUB/PDF 元数据保存时写回文件本身；关闭后改动只存书库。网盘同步场景建议关闭（回写会导致整文件重传）。</p>
             </template>
 
             <!-- 打开方式 -->
