@@ -124,6 +124,10 @@ fn migrate_id_drift(
         moved.added_time = if moved.added_time == 0 { now } else { moved.added_time };
         migrate_custom_cover(ctx, old_id, new_hash);
         migrate_derived(ctx, old_id, new_hash);
+        // 旧条目须同步从内存索引移除（不能用 drop_item：封面/派生缓存的 rename 迁移静默失败时，
+        // drop_item 会把仍停留在旧名的用户自定义封面一并删除）；
+        // 漏删则旧 id 残留索引，/item/list 同一本书出现两条，重启注水后才消失
+        ctx.index.remove(old_id);
         ctx.store.delete(old_id).ok();
         persist_and_upsert(ctx, moved);
         ctx.bus.emit(names::ITEM_REMOVED, serde_json::json!({ "id": old_id }));
@@ -386,5 +390,78 @@ impl SharedCore {
         Arc::new(SharedCore {
             index: std::sync::Mutex::new(ItemIndex::new()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::events::EventBus;
+
+    fn temp_library(tag: &str) -> LibraryPaths {
+        let dir = std::env::temp_dir().join(format!("sumi-pipeline-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        LibraryPaths::new(dir.to_str().unwrap(), Some(dir.join("cache").to_str().unwrap().to_string()))
+    }
+
+    /// 分支 2：整体移动后旧 id 不得残留在内存索引。
+    /// 回归：编辑元数据写回文件 → id 漂移走分支 2，旧条目曾只从持久层删除、
+    /// 内存索引残留 → /item/list 同一本书出现两条，重启后消失
+    #[test]
+    fn branch2_move_removes_old_id_from_memory_index() {
+        let paths = temp_library("drift");
+        paths.ensure_layout();
+        // 强制配置文件模式（分支 2 的语义即「TOML rename」）
+        std::fs::write(&paths.storage_mode_file, "toml").unwrap();
+
+        let file_rel = "novels/三体.txt";
+        std::fs::create_dir_all(format!("{}/novels", paths.root)).unwrap();
+        std::fs::write(format!("{}/{file_rel}", paths.root), "内容 A").unwrap();
+
+        let store = MetadataStore::open(paths.clone());
+        assert_eq!(store.mode(), crate::core::metadata_store::StorageMode::Toml);
+        let mut index = ItemIndex::new();
+        let bus = EventBus::new();
+        let mut ctx = PipelineCtx {
+            paths: &paths,
+            index: &mut index,
+            store: &store,
+            bus: &bus,
+            fulltext: None,
+        };
+
+        // 预置单路径旧条目（old_id = 内容 A 的哈希）
+        let old_id = hash_file(&paths.to_absolute(file_rel).unwrap()).unwrap();
+        let old_item = ItemCore::new(&old_id, vec![PathRecord::new(file_rel, 7, 1000)], 1000);
+        persist_and_upsert(&mut ctx, old_item);
+        assert_eq!(ctx.index.len(), 1);
+
+        // 文件内容变更 → hash 漂移（模拟 embed 写回）
+        std::fs::write(format!("{}/{file_rel}", paths.root), "内容 A 改写后的更长正文").unwrap();
+        let new_hash = hash_file(&paths.to_absolute(file_rel).unwrap()).unwrap();
+        assert_ne!(old_id, new_hash);
+
+        let moved = apply_file_fact(&mut ctx, file_rel, 27, 2000).unwrap();
+        assert_eq!(moved, new_hash);
+
+        // 核心断言：旧 id 不得残留在内存索引
+        assert!(ctx.index.get(&old_id).is_none(), "旧 id 残留在内存索引");
+        assert!(ctx.index.get(new_hash.as_str()).is_some());
+        assert_eq!(ctx.index.len(), 1, "索引中不得出现重复条目");
+        assert_eq!(ctx.index.owner_of(file_rel), Some(new_hash.as_str()));
+        let item = ctx.index.get(new_hash.as_str()).unwrap();
+        assert_eq!(item.paths.len(), 1);
+        assert_eq!(item.paths[0].path, file_rel);
+        assert_eq!(item.paths[0].size, 27);
+        assert_eq!(item.paths[0].modification_time, 2000);
+
+        // 持久层同步：重开 store 只见新 id（配置文件模式下旧 <old_id>.toml 已 rename）
+        let reloaded = MetadataStore::open(paths.clone()).load_all();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].id, new_hash);
+        assert!(reloaded.iter().all(|i| i.id != old_id));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
     }
 }
