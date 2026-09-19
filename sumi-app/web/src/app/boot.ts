@@ -83,7 +83,13 @@ function subscribeServerEvents(): void {
         }
       },
       'item.trashed': (p) => {
-        books.dropItem((p as { id: string }).id);
+        const id = (p as { id: string }).id;
+        books.dropItem(id);
+        // 选择集同步移除，避免批量条/多选残留已回收书籍
+        ui.selectedIds = ui.selectedIds.filter((x) => x !== id);
+        if (ui.selectedId === id) {
+          ui.selectedId = null;
+        }
         // 回收站态下新移入的条目需刷新列表（与 item.restored 对称）
         if (books.filter.inTrash) {
           books.load().catch(() => {});
@@ -97,7 +103,12 @@ function subscribeServerEvents(): void {
         library.refreshAll().catch(() => {});
       },
       'item.removed': (p) => {
-        books.dropItem((p as { id: string }).id);
+        const id = (p as { id: string }).id;
+        books.dropItem(id);
+        ui.selectedIds = ui.selectedIds.filter((x) => x !== id);
+        if (ui.selectedId === id) {
+          ui.selectedId = null;
+        }
         library.refreshDimensions().catch(() => {});
       },
       'folder.changed': () => {

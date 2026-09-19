@@ -782,6 +782,8 @@ multipart/form-data 上传新 item（web 端用）：浏览器无本地文件路
 
 更新元数据（写入 `.sumi/metadata/`）。`name`、`folder_path` 会同步操作真实文件。
 
+回收站限制：目标位置在回收站（`.sumi/trash/`）内时，`name` / `folder_path`（改名/移动）被拒绝（`INVALID_PARAM`，提示先恢复）；纯元数据编辑不受影响。放回原位是 trash 恢复端点的职责。
+
 #### 请求
 
 | 参数        | 类型     | 必填 | 说明                                               |

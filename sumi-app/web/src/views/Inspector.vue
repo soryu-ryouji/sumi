@@ -1,14 +1,17 @@
 <script setup lang="ts">
-// 详情侧板：选中书籍时展示/编辑元数据（update）、路径操作、封面管理、移入回收站（viewer 只读时仅展示）；
-// 未选中书籍时显示当前分区概览（文件夹分区 → 文件夹信息，其余 → 书库整体信息）。
+// 详情侧板：选中书籍时展示/编辑元数据（update）、路径操作、文件夹移动、封面管理、移入回收站（viewer 只读时仅展示）；
+// 多选时顶部批量条提供批量移动；未选中书籍时显示当前分区概览（文件夹分区 → 文件夹信息，其余 → 书库整体信息）。
 import { computed, reactive, ref, watch } from 'vue';
 import { useUi } from '@/stores/ui';
 import { useBooks } from '@/stores/books';
 import { useConnection } from '@/stores/connection';
 import { useLibrary } from '@/stores/library';
 import { api, directUrl } from '@/shared/api/client';
+import { primaryPathOf } from '@/shared/lib/item';
 import { formatBytes, formatTime, READ_STATUS_LABEL } from '@/shared/format';
 import { shell } from '@/app/shell';
+import { moveItemsToFolder } from '@/shared/lib/move';
+import FolderPickerDialog from './FolderPickerDialog.vue';
 import type { FolderNode, Item } from '@/shared/api/types';
 
 const ui = useUi();
@@ -18,6 +21,28 @@ const library = useLibrary();
 
 const item = computed<Item | null>(() => books.items.find((i) => i.id === ui.selectedId) ?? null);
 const show = computed(() => item.value !== null);
+
+// —— 移动入口（单选「文件夹」行 / 多选批量条；回收站视图不提供移动） ——
+const moveAllowed = computed(() => conn.writable && !books.filter.inTrash);
+const multiSelected = computed(() => moveAllowed.value && show.value && ui.selectedIds.length > 1);
+/** 主选中的主路径所在目录（'' = 书库根） */
+const primaryFolder = computed(() => {
+  const p = item.value ? primaryPathOf(item.value) : '';
+  const i = p.lastIndexOf('/');
+  return i < 0 ? '' : p.slice(0, i);
+});
+const folderLabel = computed(() => primaryFolder.value || '（书库根目录）');
+const showFolderDialog = ref(false);
+
+/** 对话框确定：多选批量移、单选只移主选中 */
+function onMoveConfirm(path: string): void {
+  showFolderDialog.value = false;
+  if (ui.selectedIds.length > 1) {
+    void moveItemsToFolder([...ui.selectedIds], path);
+  } else if (item.value) {
+    void moveItemsToFolder([item.value.id], path);
+  }
+}
 
 // 分区概览：在文件夹树中递归定位当前筛选的文件夹（找不到时名称回退为路径最后一段）
 function findFolderNode(nodes: FolderNode[], path: string): FolderNode | null {
@@ -207,6 +232,11 @@ async function removeCover(): Promise<void> {
   <aside v-if="ui.showInspector" class="inspector">
     <!-- 选中书籍：元数据展示/编辑 -->
     <div v-if="show && item" class="inspector-scroll">
+      <!-- 多选批量条：不微批编辑，仅提供批量移动 -->
+      <div v-if="multiSelected" class="batch-bar">
+        <span class="batch-count">已选 {{ ui.selectedIds.length }} 本</span>
+        <button class="btn small" @click="showFolderDialog = true">移动到文件夹…</button>
+      </div>
       <div class="inspector-cover">
         <img :src="directUrl('/item/cover', { id: item.id })" :alt="item.title" />
         <div v-if="conn.writable" class="cover-actions">
@@ -225,6 +255,14 @@ async function removeCover(): Promise<void> {
           <div class="meta-row"><span>状态</span><b>{{ READ_STATUS_LABEL[item.read_status] ?? item.read_status }}</b></div>
           <div class="meta-row"><span>进度</span><b>{{ item.progress }}%</b></div>
           <div class="meta-row"><span>格式</span><b>{{ item.ext.toUpperCase() }} · {{ formatBytes(item.size) }}</b></div>
+          <div
+            class="meta-row folder-row"
+            :class="{ clickable: moveAllowed }"
+            :title="moveAllowed ? '点击移动到其他文件夹' : ''"
+            @click="moveAllowed && (showFolderDialog = true)"
+          >
+            <span>文件夹</span><b>{{ folderLabel }}</b>
+          </div>
           <div class="meta-row"><span>入库</span><b>{{ formatTime(item.added_time) }}</b></div>
           <div v-if="item.publisher" class="meta-row"><span>出版社</span><b>{{ item.publisher }}</b></div>
           <div v-if="item.pubdate" class="meta-row"><span>出版</span><b>{{ item.pubdate }}</b></div>
@@ -310,6 +348,13 @@ async function removeCover(): Promise<void> {
         </div>
       </template>
     </div>
+    <FolderPickerDialog
+      v-if="showFolderDialog"
+      :title="ui.selectedIds.length > 1 ? `移动 ${ui.selectedIds.length} 本书到文件夹` : '移动到文件夹'"
+      :current="ui.selectedIds.length > 1 ? null : primaryFolder"
+      @confirm="onMoveConfirm"
+      @cancel="showFolderDialog = false"
+    />
   </aside>
 </template>
 
@@ -327,6 +372,22 @@ async function removeCover(): Promise<void> {
   flex: 1;
   overflow-y: auto;
   padding: 16px;
+}
+/* 多选批量条（面板顶部） */
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.batch-count {
+  flex: 1;
+  font-size: 12px;
+  color: var(--muted);
 }
 .inspector-cover {
   display: flex;
@@ -377,6 +438,15 @@ async function removeCover(): Promise<void> {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 「文件夹」行：可写时点击弹移动对话框 */
+.folder-row.clickable {
+  cursor: pointer;
+  border-radius: 4px;
+}
+.folder-row.clickable:hover b {
+  color: var(--accent);
+  text-decoration: underline;
 }
 .i-chips {
   display: flex;

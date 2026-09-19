@@ -8,6 +8,7 @@ import { useLibrary } from '@/stores/library';
 import { useConnection } from '@/stores/connection';
 import { api, directUrl } from '@/shared/api/client';
 import { formatTime } from '@/shared/format';
+import { primaryPathOf } from '@/shared/lib/item';
 import type { Item } from '@/shared/api/types';
 
 const books = useBooks();
@@ -57,7 +58,7 @@ async function clearAll(): Promise<void> {
         <img class="trash-cover" :src="directUrl('/item/cover', { id: item.id })" :alt="item.title" loading="lazy" />
         <div class="trash-info">
           <div class="trash-name">{{ item.title || item.name }}</div>
-          <div class="trash-path">{{ item.paths[0] }}</div>
+          <div class="trash-path">{{ primaryPathOf(item) }}</div>
           <div class="trash-time">移入于 {{ formatTime(item.added_time) }}</div>
         </div>
         <button v-if="conn.writable" class="btn" @click="restore(item)">恢复</button>

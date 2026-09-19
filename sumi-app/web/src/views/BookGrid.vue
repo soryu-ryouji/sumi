@@ -3,10 +3,12 @@
 import { onMounted, onUnmounted, ref } from 'vue';
 import { useBooks } from '@/stores/books';
 import { useLibrary } from '@/stores/library';
+import { useUi } from '@/stores/ui';
 import BookCard from './BookCard.vue';
 
 const books = useBooks();
 const library = useLibrary();
+const ui = useUi();
 
 // 冷启动：boot 已触发首载；此处兜底（直连/SSE 恢复等场景 store 仍空时）
 if (!books.items.length && !books.loading && books.total === 0) {
@@ -35,10 +37,18 @@ onUnmounted(() => observer?.disconnect());
 function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
+
+/** 点击网格空白处（非卡片，卡片自身已 stop）清空多选集 */
+function onBackgroundClick(e: MouseEvent): void {
+  const t = e.target as HTMLElement;
+  if (t === e.currentTarget || t.classList.contains('book-grid') || t.classList.contains('grid-sentinel') || t.classList.contains('grid-state')) {
+    ui.clearSelection();
+  }
+}
 </script>
 
 <template>
-  <div ref="scroller" class="grid-scroller">
+  <div ref="scroller" class="grid-scroller" @click="onBackgroundClick">
     <div v-if="books.error" class="grid-state error">
       <div>加载失败：{{ errorText(books.error) }}</div>
       <button class="btn" @click="books.load()">重试</button>

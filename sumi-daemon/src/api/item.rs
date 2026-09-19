@@ -1097,6 +1097,11 @@ async fn update(
         .as_deref()
         .map(|f| f.trim().trim_end_matches('/'));
     if new_name.is_some() || new_folder.is_some() {
+        // 回收站保护：回收站位置不可改名/移动（放回原位是 trash 恢复端点的职责），
+        // 与 batch_update 的 is_in_trash 跳过同口径；纯元数据编辑不受此限
+        if LibraryPaths::is_in_trash(&target_path) {
+            return Err(envelope::ApiError::invalid_param("回收站中的文件不支持改名/移动，请先恢复"));
+        }
         let dir = new_folder.unwrap_or(LibraryPaths::dir_of(&target_path));
         if !dir.is_empty() && !LibraryPaths::is_valid_library_path(Some(dir)) {
             return Err(envelope::ApiError::invalid_param(format!("非法 folder_path: {dir}")));

@@ -1,19 +1,26 @@
 <script setup lang="ts">
 // 侧栏：顶部拖拽条（macOS 红绿灯压左端，内容只放右端）+ 书库导航（全部书籍/回收站，回收站由 books.filter.inTrash 驱动内容区切换）
 // + 文件夹树 + 分类/标签/作者/系列聚合。区块标题行可折叠，显隐可在设置「界面」中配置（偏好持久化在 ui store）。
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import { useLibrary } from '@/stores/library';
 import { useBooks } from '@/stores/books';
 import { useUi } from '@/stores/ui';
+import { useConnection } from '@/stores/connection';
 import { hasShell, isMac, TRAFFIC_INSET, dragDoubleclickMaximize } from '@/shared/lib/platform';
+import { createFolder } from '@/shared/lib/move';
 import { shell } from '@/app/shell';
 import type { CountEntry } from '@/shared/api/types';
 import FolderTreeNode from './FolderTreeNode.vue';
+import InputDialog from './InputDialog.vue';
 
 const library = useLibrary();
 const books = useBooks();
 const ui = useUi();
+const conn = useConnection();
 const showBrand = !isMac();
+
+/** 根下新建文件夹对话框（文件夹区块标题行「＋」入口） */
+const showNewFolder = ref(false);
 
 const dimensions = computed(() =>
   [
@@ -110,11 +117,16 @@ const entryCount = (e: CountEntry) => e.count;
         </template>
       </div>
 
-      <div v-if="library.tree.length && ui.sidebarSections.folders" class="sidebar-section">
-        <button class="sidebar-head sec-toggle" @click="ui.toggleSidebarSection('folders')">
-          <span class="sec-caret" :class="{ open: !ui.sidebarCollapsed.folders }">▸</span>
-          <span class="sidebar-title">文件夹</span>
-        </button>
+      <!-- 区块显隐只看用户设置；标题行（含＋新建入口）不依赖树非空——空库也要能建第一个文件夹 -->
+      <div v-if="ui.sidebarSections.folders" class="sidebar-section">
+        <!-- 标题行右侧「＋」= 根下新建文件夹（可写时显示；行内嵌套按钮非法，改为同排双控件） -->
+        <div class="sec-head-row">
+          <button class="sidebar-head sec-toggle" @click="ui.toggleSidebarSection('folders')">
+            <span class="sec-caret" :class="{ open: !ui.sidebarCollapsed.folders }">▸</span>
+            <span class="sidebar-title">文件夹</span>
+          </button>
+          <button v-if="conn.writable" class="sec-add" title="新建文件夹（书库根目录）" @click="showNewFolder = true">＋</button>
+        </div>
         <template v-if="!ui.sidebarCollapsed.folders">
           <FolderTreeNode v-for="node in library.tree" :key="node.path" :node="node" :active="books.filter.folder" @select="selectFolder" />
         </template>
@@ -140,6 +152,14 @@ const entryCount = (e: CountEntry) => e.count;
         </template>
       </div>
     </div>
+    <InputDialog
+      v-if="showNewFolder"
+      title="新建文件夹"
+      placeholder="文件夹名（建在书库根目录）"
+      confirm-label="创建"
+      @confirm="(v) => { showNewFolder = false; void createFolder(v); }"
+      @cancel="showNewFolder = false"
+    />
   </aside>
 </template>
 <style scoped>
@@ -213,6 +233,31 @@ const entryCount = (e: CountEntry) => e.count;
   text-align: left;
   cursor: pointer;
   -webkit-app-region: no-drag;
+}
+/* 文件夹区块标题行：折叠钮 + 右侧新建钮同排（其余区块保持原单一标题钮） */
+.sec-head-row {
+  display: flex;
+  align-items: center;
+}
+.sec-head-row .sec-toggle {
+  flex: 1;
+  width: auto;
+}
+.sec-add {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.sec-add:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 /* caret 展开态旋转 90°（与文件夹树 tree-caret 同款） */
 .sec-caret {

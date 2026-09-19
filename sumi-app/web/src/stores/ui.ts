@@ -1,6 +1,7 @@
-// 界面状态：选中项、面板显隐/区块偏好、轻提示。
+// 界面状态：选中项（单选 + 多选集）、面板显隐/区块偏好、轻提示。
 // 回收站不是独立视图：内容区切换由 books.filter.inTrash 驱动（侧栏导航/筛选负责置位）。
 import { defineStore } from 'pinia';
+import { useBooks } from './books';
 
 /** 侧栏/详情面板的显隐偏好（localStorage 持久化；详情默认隐藏，点击书籍不弹出、由顶栏开关控制） */
 const PANELS_KEY = 'sumi.panels';
@@ -67,8 +68,10 @@ export interface Toast {
 
 export const useUi = defineStore('ui', {
   state: () => ({
-    /** 详情侧板选中的 item id */
+    /** 详情侧板选中的 item id（多选时为最后点选项，Inspector 展示用） */
     selectedId: null as string | null,
+    /** 多选集（Ctrl/Cmd 点选追加、Shift 点选区间；批量移动/标签等操作的数据源） */
+    selectedIds: [] as string[],
     /** 详情侧板直接进编辑态（上下文菜单「编辑元数据」置位，Inspector 消费后复位） */
     inspectorEdit: false,
     /** 左侧栏显隐（顶栏开关，持久化） */
@@ -85,6 +88,51 @@ export const useUi = defineStore('ui', {
     toasts: [] as Toast[],
   }),
   actions: {
+    /** 单选：重置选择集为该项（普通点击） */
+    selectOnly(id: string) {
+      this.selectedIds = [id];
+      this.selectedId = id;
+    },
+    /** Ctrl/Cmd 点选：在选择集中追加/移除；主选中跟随点选项，移除后脱离选择集时回退末位 */
+    toggleSelect(id: string) {
+      this.selectedIds = this.selectedIds.includes(id)
+        ? this.selectedIds.filter((x) => x !== id)
+        : [...this.selectedIds, id];
+      if (!this.selectedIds.length) {
+        this.selectedId = null;
+      } else if (this.selectedIds.includes(id)) {
+        // 追加（或本就在集合中）：主选中跟随本次点选项
+        this.selectedId = id;
+      } else if (this.selectedId === null || !this.selectedIds.includes(this.selectedId)) {
+        // 移除后主选中脱离选择集：回退到选择集末位
+        this.selectedId = this.selectedIds[this.selectedIds.length - 1];
+      }
+    },
+    /** Shift 点选：以主选中为锚点，把列表当前顺序中锚点到该项的闭区间并入选择集
+     *  （无锚点时退化为单选）；锚点/目标不在当前列表中（分页/SSE 刷新间隙）也退化为单选 */
+    rangeSelectTo(id: string) {
+      const books = useBooks();
+      const anchor = this.selectedId;
+      const ids = books.items.map((i) => i.id);
+      const a = anchor ? ids.indexOf(anchor) : -1;
+      const b = ids.indexOf(id);
+      if (a < 0 || b < 0) {
+        this.selectOnly(id);
+        return;
+      }
+      const [lo, hi] = a <= b ? [a, b] : [b, a];
+      const set = new Set(this.selectedIds);
+      for (let k = lo; k <= hi; k++) {
+        set.add(ids[k]);
+      }
+      this.selectedIds = [...set];
+      this.selectedId = id;
+    },
+    /** 清空多选集与主选中（点击空白处等） */
+    clearSelection() {
+      this.selectedIds = [];
+      this.selectedId = null;
+    },
     toggleSidebar() {
       this.showSidebar = !this.showSidebar;
       writePanels(this.showSidebar, this.showInspector);
